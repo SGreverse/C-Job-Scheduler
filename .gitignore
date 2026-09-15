@@ -1,5 +1,5 @@
 *.o
 *.out
 scheduler
-build_release
+*.py
 .vscode/
