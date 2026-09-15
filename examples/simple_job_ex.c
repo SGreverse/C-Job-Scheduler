@@ -19,6 +19,7 @@ void print_hello_chunk(void* user_data, size_t start_idx, size_t end_idx) {
 
 int main(void) {
 
+    //initializes the worker threads and allocates for each worker his own spsc buffer and chase-lev deque
     scheduler_boot(1024,4096);
 
     message_payload my_payload;
@@ -28,7 +29,6 @@ int main(void) {
     scheduler_init_job(&message_job, &my_payload, 10, print_hello_chunk);
 
 
-    // chunk size is rounded up to 4
     if (!scheduler_submit_job(&message_job, 3)) {
         fprintf(stderr, "Failed to submit job to the scheduler.\n");
         scheduler_stop_workers();

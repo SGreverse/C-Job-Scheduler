@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c99 -O3 -g3 -march=native -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L -Iinclude
+CFLAGS = -Wall -Wextra -std=c99 -O3 -g3 -march=native  -Iinclude
 
 SRC = $(wildcard src/*.c)
 OBJ = $(SRC:.c=.o)
