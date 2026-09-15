@@ -1,0 +1,5 @@
+*.o
+*.out
+scheduler
+build_release
+.vscode/
