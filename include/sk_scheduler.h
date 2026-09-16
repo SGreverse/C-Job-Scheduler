@@ -14,8 +14,9 @@
 #include <stddef.h>
 #include <stdalign.h>
 #include <stdbool.h>
-#include <unistd.h>
-
+#if !defined (_WIN32)
+    #include <unistd.h>
+#endif
 extern sc_worker* worker_pool;
 
 //the function each worker will call to execute( written and passed by the developer)

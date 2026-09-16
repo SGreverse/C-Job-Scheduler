@@ -3,3 +3,4 @@
 scheduler
 *.py
 .vscode/
+main.c

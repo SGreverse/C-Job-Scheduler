@@ -2,15 +2,16 @@
     #define _GNU_SOURCE 
 #endif
 
-#include <pthread.h>
 #include <stdio.h>
 
 #if defined(__linux__)
+    #include <pthread.h>
     #include <sched.h>
 #elif defined(_WIN32)
     #define WIN32_LEAN_AND_MEAN
     #include <windows.h>
 #elif defined(__APPLE__)
+    #include <pthread.h>
     #include <mach/mach_init.h>
     #include <mach/thread_policy.h>
     #include <mach/thread_act.h>
@@ -21,7 +22,6 @@
 #include "sk_task.h"
 #include <stdio.h>
 #include <stdlib.h>
-#include <threads.h>
 #include <stdatomic.h>
 
 

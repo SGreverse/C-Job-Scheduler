@@ -1,7 +1,13 @@
 #pragma once
 
-#include <bits/pthreadtypes.h>
-#include <pthread.h>
+#if defined(_WIN32)
+    #include <windows.h>
+    typedef HANDLE sk_thread_t;
+#else
+    #include <pthread.h>
+    typedef pthread_t sk_thread_t;
+#endif
+
 #include <stdalign.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -30,7 +36,7 @@ typedef struct{
     
     alignas(64) size_t core_id;
 
-    pthread_t thread_handler;
+    sk_thread_t thread_handler;
 
     atomic_bool termination_flag;
 

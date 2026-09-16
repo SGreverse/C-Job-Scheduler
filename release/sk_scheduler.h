@@ -21,8 +21,9 @@
 #include <stddef.h>
 #include <stdalign.h>
 #include <stdbool.h>
-#include <unistd.h>
-
+#if !defined (_WIN32)
+    #include <unistd.h>
+#endif
 
 //the function each worker will call to execute( written and passed by the developer)
 typedef void (*sc_job_fn)(void* user_data, size_t start_idx, size_t end_idx);
@@ -205,8 +206,14 @@ sc_task* chase_lev_steal(sc_cl_deque* victim_deque);
 /* --- sk_worker.h --- */
 #pragma once
 
-#include <bits/pthreadtypes.h>
-#include <pthread.h>
+#if defined(_WIN32)
+    #include <windows.h>
+    typedef HANDLE sk_thread_t;
+#else
+    #include <pthread.h>
+    typedef pthread_t sk_thread_t;
+#endif
+
 #include <stdalign.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -233,7 +240,7 @@ typedef struct{
     
     alignas(64) size_t core_id;
 
-    pthread_t thread_handler;
+    sk_thread_t thread_handler;
 
     atomic_bool termination_flag;
 
@@ -397,22 +404,22 @@ sc_task* chase_lev_steal(sc_cl_deque *victim_deque){
     #define _GNU_SOURCE 
 #endif
 
-#include <pthread.h>
 #include <stdio.h>
 
 #if defined(__linux__)
+    #include <pthread.h>
     #include <sched.h>
 #elif defined(_WIN32)
     #define WIN32_LEAN_AND_MEAN
     #include <windows.h>
 #elif defined(__APPLE__)
+    #include <pthread.h>
     #include <mach/mach_init.h>
     #include <mach/thread_policy.h>
     #include <mach/thread_act.h>
 #endif
 #include <stdio.h>
 #include <stdlib.h>
-#include <threads.h>
 #include <stdatomic.h>
 
 
@@ -682,17 +689,16 @@ void internal_macro_job_splitter(void* payload, size_t start_idx, size_t end_idx
 }
 
 /* --- sk_scheduler.c --- */
-#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
-    #define _POSIX_C_SOURCE 199309L
-#endif
+
 
 #if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
+    #define _POSIX_C_SOURCE 199309L
     #include <sched.h>
+    #include <pthread.h>
 #elif defined(_WIN32)
     #include <windows.h>
 #endif
 
-#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -887,10 +893,17 @@ void scheduler_boot(size_t spsc_queue_size,size_t cl_deque_size){
         return;
     }
     for(size_t i=0;i<lp_count;i++){
-        int result=pthread_create(&worker_pool[i].thread_handler,NULL,worker_main_loop,&worker_pool[i]);
-        if(result!=0){
-            fprintf(stderr,"Thread Creating Error:Thread #%lu couldn't be created",i+1);
-        }
+        #if defined(_WIN32)
+            worker_pool[i].thread_handler = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)worker_main_loop, &worker_pool[i], 0, NULL);
+            if(!worker_pool[i].thread_handler){
+                fprintf(stderr,"Thread Creating Error:Thread #%lu couldn't be created",i+1);
+            }
+        #else
+            int result=pthread_create(&worker_pool[i].thread_handler, NULL, worker_main_loop, &worker_pool[i]);
+            if(result!=0){
+                fprintf(stderr,"Thread Creating Error:Thread #%lu couldn't be created",i+1);
+            }
+        #endif
     }
 
 }
@@ -1051,7 +1064,12 @@ void scheduler_stop_workers(){
     }
 
     for (size_t i = 0; i < lp_count; i++) {
-        pthread_join(worker_pool[i].thread_handler, NULL);
+        #if defined(_WIN32)
+            WaitForSingleObject(worker_pool[i].thread_handler, INFINITE);
+            CloseHandle(worker_pool[i].thread_handler);
+        #else
+            pthread_join(worker_pool[i].thread_handler, NULL);
+        #endif
     }
 
     for (size_t i = 0; i < lp_count; i++) {
@@ -1085,16 +1103,20 @@ void scheduler_wait_for_job(sc_job* job) {
             spin_count++;
         } 
         else if (yield_count < 50) {
-#if defined(_WIN32)
-            Sleep(0);
-#else
-            sched_yield(); 
-#endif
+            #if defined(_WIN32)
+                Sleep(0);
+            #else
+                sched_yield(); 
+            #endif
             yield_count++;
         } 
         else {
-            struct timespec ts = {0, sleep_ns};
-            nanosleep(&ts,NULL);
+            #if defined(_WIN32)
+                Sleep((DWORD)(sleep_ns / 1000000));
+            #else
+                struct timespec ts = {0, sleep_ns};
+                nanosleep(&ts, NULL);
+            #endif
             
             if (sleep_ns < 1000000) {
                 sleep_ns *= 2; 

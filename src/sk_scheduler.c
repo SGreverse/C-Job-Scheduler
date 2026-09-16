@@ -1,16 +1,15 @@
-#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
-    #define _POSIX_C_SOURCE 199309L
-#endif
+
 
 #if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
+    #define _POSIX_C_SOURCE 199309L
     #include <sched.h>
+    #include <pthread.h>
 #elif defined(_WIN32)
     #include <windows.h>
 #endif
 
 #include "sk_memory_utils.h"
 #include "sk_scheduler.h"
-#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -205,10 +204,17 @@ void scheduler_boot(size_t spsc_queue_size,size_t cl_deque_size){
         return;
     }
     for(size_t i=0;i<lp_count;i++){
-        int result=pthread_create(&worker_pool[i].thread_handler,NULL,worker_main_loop,&worker_pool[i]);
-        if(result!=0){
-            fprintf(stderr,"Thread Creating Error:Thread #%lu couldn't be created",i+1);
-        }
+        #if defined(_WIN32)
+            worker_pool[i].thread_handler = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)worker_main_loop, &worker_pool[i], 0, NULL);
+            if(!worker_pool[i].thread_handler){
+                fprintf(stderr,"Thread Creating Error:Thread #%lu couldn't be created",i+1);
+            }
+        #else
+            int result=pthread_create(&worker_pool[i].thread_handler, NULL, worker_main_loop, &worker_pool[i]);
+            if(result!=0){
+                fprintf(stderr,"Thread Creating Error:Thread #%lu couldn't be created",i+1);
+            }
+        #endif
     }
 
 }
@@ -369,7 +375,12 @@ void scheduler_stop_workers(){
     }
 
     for (size_t i = 0; i < lp_count; i++) {
-        pthread_join(worker_pool[i].thread_handler, NULL);
+        #if defined(_WIN32)
+            WaitForSingleObject(worker_pool[i].thread_handler, INFINITE);
+            CloseHandle(worker_pool[i].thread_handler);
+        #else
+            pthread_join(worker_pool[i].thread_handler, NULL);
+        #endif
     }
 
     for (size_t i = 0; i < lp_count; i++) {
@@ -403,16 +414,20 @@ void scheduler_wait_for_job(sc_job* job) {
             spin_count++;
         } 
         else if (yield_count < 50) {
-#if defined(_WIN32)
-            Sleep(0);
-#else
-            sched_yield(); 
-#endif
+            #if defined(_WIN32)
+                Sleep(0);
+            #else
+                sched_yield(); 
+            #endif
             yield_count++;
         } 
         else {
-            struct timespec ts = {0, sleep_ns};
-            nanosleep(&ts,NULL);
+            #if defined(_WIN32)
+                Sleep((DWORD)(sleep_ns / 1000000));
+            #else
+                struct timespec ts = {0, sleep_ns};
+                nanosleep(&ts, NULL);
+            #endif
             
             if (sleep_ns < 1000000) {
                 sleep_ns *= 2; 
