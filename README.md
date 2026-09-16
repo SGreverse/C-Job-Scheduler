@@ -2,7 +2,7 @@
 
 A high-performance, lock-free task scheduling engine for C, designed for maximum concurrency and hardware utilization. 
 
-`sk-scheduler` is built on a Work-Stealing Chase-Lev deque architecture. It allows you to break massive workloads into small tasks and distribute them across all available CPU cores with virtually zero thread-contention. 
+the `sk-scheduler` is built on a Work-Stealing Chase-Lev deque architecture. It allows you to break massive workloads into small tasks and distribute them across all available CPU cores with virtually zero thread-contention. 
 
 (for anyone wondering,the sk part is based on my initials)
 ## Features
@@ -27,6 +27,27 @@ A high-performance, lock-free task scheduling engine for C, designed for maximum
     ```
 
 In all other files where you need the API, use `#include "sk_scheduler.h"` as normal.
+
+### Compiler Requirements
+
+Because this engine uses lock-free C11 Atomics and OS-level thread management, you must configure your compiler to recognize these features.
+
+**Linux / macOS (GCC & Clang):**
+You must link the pthread library and enable GNU extensions for CPU pinning:
+```bash
+gcc main.c -o my_program -lpthread -D_GNU_SOURCE -O3
+```
+**Windows:**
+Microsoft's MSVC compiler hides C11 <stdatomic.h> support behind strict standard-conformance flags. You must pass the following flags to your compiler/CMake target:
+* /TC : Force compilation strictly as C code (not C++).
+
+* /std:c11 : Force the C11 standard.
+
+* /Zc:preprocessor : Enable the standard-conformant preprocessor.
+
+* /experimental:c11atomics : Explicitly unlock standard atomics.
+
+if you installed everything and still found problems, you can try looking into the errors and solve them yourself.
 
 ## Quick Start
 
@@ -71,10 +92,10 @@ for more types of examples, you can check out the examples folder and try runnin
 
 ## Current Progress
 
-right now, the scheduler is only in v1. it has been stress tested on my ubuntu machine only but i will try to conduct more tests on different machines/OS and try to find more bugs.
+right now, the scheduler is only in v1. it has been stress tested on my ubuntu linux machine and my windows machine only but i will try to conduct more tests on different machines/OS and try to find more bugs.
 
 ## Documentation
-For a deep dive into the DAG architecture, memory pool mechanics, and advanced sub-task spawning, please refer to the <a href='no_docs_yet_be_patient_please'>Full Documentation</a>.
+For a more deep explanation into the project architecture,mechanics, and concepts please refer to the <a href='no_docs_yet_be_patient_please'>Full Documentation</a>.
 
 ## License
 
