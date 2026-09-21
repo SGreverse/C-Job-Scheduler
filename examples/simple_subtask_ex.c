@@ -1,8 +1,10 @@
+#define SK_SCHEDULER_IMPLEMENTATION
+#include "sk_scheduler.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
 
-#include "sk_scheduler.h"
 
 #define TOTAL_ELEMENTS 16
 

@@ -1,6 +1,6 @@
-#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
-    #define _POSIX_C_SOURCE 199309L
-#endif
+#define SK_SCHEDULER_IMPLEMENTATION
+#include "sk_scheduler.h"
+
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,9 +9,6 @@
 #include <stdbool.h>
 #include <string.h>
 
-// Uncomment when testing as the main entry point with the release header
-// #define SK_SCHEDULER_IMPLEMENTATION
-#include "sk_scheduler.h"
 
 // Note: 100,000,000 across 100 runs might take a while to benchmark. 
 // You can lower ARRAY_SIZE if the total runtime is too long.

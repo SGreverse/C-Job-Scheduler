@@ -1,9 +1,12 @@
+#define SK_SCHEDULER_IMPLEMENTATION
+#include "sk_scheduler.h"
+
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
 
-//the library to use
-#include "sk_scheduler.h"
+
 
 typedef struct {
     const char* message;

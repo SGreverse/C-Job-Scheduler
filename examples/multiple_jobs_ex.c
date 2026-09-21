@@ -1,10 +1,9 @@
-#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
-    #define _POSIX_C_SOURCE 199309L
-#endif
+#define SK_SCHEDULER_IMPLEMENTATION
+#include "sk_scheduler.h"
+
 
 #include <stdio.h>
 #include <stdlib.h>
-#include "sk_scheduler.h"
 
 // Scaled down to prevent flooding the terminal, 
 // generating exactly 4 chunks per system.

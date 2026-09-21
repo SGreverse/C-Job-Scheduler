@@ -1,14 +1,11 @@
-#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
-    #define _POSIX_C_SOURCE 199309L
-#endif
+#define SK_SCHEDULER_IMPLEMENTATION
+#include "sk_scheduler.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 #include <stdint.h>
 #include <stdbool.h>
-
-#include "sk_scheduler.h"
 
 #define ARRAY_SIZE 10000000
 #define NUM_ITERATIONS 100

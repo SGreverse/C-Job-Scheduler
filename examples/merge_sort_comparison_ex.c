@@ -1,6 +1,5 @@
-#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
-    #define _POSIX_C_SOURCE 199309L
-#endif
+#define SK_SCHEDULER_IMPLEMENTATION
+#include "sk_scheduler.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,7 +8,6 @@
 #include <stdbool.h>
 #include <string.h>
 
-#include "sk_scheduler.h"
 
 // NOTE TO VIEWER OF THIS EXAMPLE: change these defines as you please
 #define ARRAY_SIZE 100000
