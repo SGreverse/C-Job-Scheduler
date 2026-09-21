@@ -95,7 +95,7 @@ for more types of examples, you can check out the examples folder and try runnin
 right now, the scheduler is only in v1. it has been stress tested on my ubuntu linux machine and my windows machine only but i will try to conduct more tests on different machines/OS and try to find more bugs.
 
 ## Documentation
-For a more deep explanation into the project architecture,mechanics, and concepts please refer to the <a href='no_docs_yet_be_patient_please'>Full Documentation</a>.
+For a more deep explanation into the project architecture,mechanics, and concepts please refer to the <a href='C%20Job%20Scheduler-Full%20documentation.pdf'>Full Documentation</a>.
 
 ## License
 
