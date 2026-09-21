@@ -88,7 +88,7 @@ sc_task* chase_lev_pop(sc_cl_deque* deque) {
     if (size > 0) return task;
 
     int64_t expected_t = t;
-    // attempt CAS race against any concurrent thieves
+    // attempt CAS race against any thieves
     bool won_race = atomic_compare_exchange_strong_explicit(
         &deque->top, 
         &expected_t, 
@@ -97,7 +97,7 @@ sc_task* chase_lev_pop(sc_cl_deque* deque) {
         memory_order_relaxed
     );
     
-    //if CAS faield, theif got the item first
+    //if CAS failed, thief got the item first
     if (!won_race) task=NULL;
     
     

@@ -238,7 +238,7 @@ void no_op_continuation(void* payload, size_t start_idx, size_t end_idx) {
     return;
 }
 
-//splits the job into tasks into 2 halfs and pushes right task to deque, until the payload size is smaller then chunk size
+//splits the job into tasks into 2 halfs and keeps pushing right task to deque, until the payload size is smaller then chunk size
 void internal_macro_job_splitter(void* payload, size_t start_idx, size_t end_idx) {
     sc_job* job = (sc_job*)payload;
 

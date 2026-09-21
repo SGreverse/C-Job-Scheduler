@@ -28,13 +28,5 @@ typedef struct sc_task_i{
 
 }sc_task;
 
-typedef struct {
-    alignas(64) atomic_uint_least64_t head;
-
-    sc_task* backing_array;
-
-    size_t total_capacity;
-} sc_memory_pool;
-
 sc_task* memory_pool_acquire();
 void memory_pool_release(sc_task* task) ;

@@ -164,14 +164,6 @@ typedef struct sc_task_i{
 
 }sc_task;
 
-typedef struct {
-    alignas(64) atomic_uint_least64_t head;
-
-    sc_task* backing_array;
-
-    size_t total_capacity;
-} sc_memory_pool;
-
 sc_task* memory_pool_acquire();
 void memory_pool_release(sc_task* task) ;
 
@@ -353,7 +345,7 @@ sc_task* chase_lev_pop(sc_cl_deque* deque) {
     if (size > 0) return task;
 
     int64_t expected_t = t;
-    // attempt CAS race against any concurrent thieves
+    // attempt CAS race against any thieves
     bool won_race = atomic_compare_exchange_strong_explicit(
         &deque->top, 
         &expected_t, 
@@ -362,7 +354,7 @@ sc_task* chase_lev_pop(sc_cl_deque* deque) {
         memory_order_relaxed
     );
     
-    //if CAS faield, theif got the item first
+    //if CAS failed, thief got the item first
     if (!won_race) task=NULL;
     
     
@@ -636,7 +628,7 @@ void no_op_continuation(void* payload, size_t start_idx, size_t end_idx) {
     return;
 }
 
-//splits the job into tasks into 2 halfs and pushes right task to deque, until the payload size is smaller then chunk size
+//splits the job into tasks into 2 halfs and keeps pushing right task to deque, until the payload size is smaller then chunk size
 void internal_macro_job_splitter(void* payload, size_t start_idx, size_t end_idx) {
     sc_job* job = (sc_job*)payload;
 
@@ -716,7 +708,7 @@ void internal_macro_job_splitter(void* payload, size_t start_idx, size_t end_idx
 
 // global memory pool,allocated at boot
 alignas(64) atomic_uint_least64_t global_pool_head;
-sc_task* global_task_array = NULL;
+alignas(64) sc_task* global_task_array = NULL;
 size_t global_task_capacity = 0;
 
 //every thread has his own cache of tasks 
@@ -1037,6 +1029,7 @@ void scheduler_spawn_subtasks(void* payload, size_t start_idx, size_t end_idx, s
             
             size_t remaining_start = start_idx + ((chunks_processed + successfully_allocated) * chunk_size);
             if (remaining_start < end_idx) {
+                //inline execution of the entire chunk left
                 task_fn(payload, remaining_start, end_idx);
             }
             return;

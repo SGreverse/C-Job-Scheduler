@@ -11,9 +11,10 @@
 
 #include "sk_scheduler.h"
 
-// NOTE TO VIEWER OF THIS EXAMPLE:change these defines as you please to see the different results 
-#define ARRAY_SIZE 10000000
+// NOTE TO VIEWER OF THIS EXAMPLE: change these defines as you please
+#define ARRAY_SIZE 100000
 #define BASE_CASE_THRESHOLD 1024
+#define NUM_RUNS 1000
 
 typedef struct {
     int* array;
@@ -87,84 +88,123 @@ void concurrent_merge_sort(void* user_data, size_t start_idx, size_t end_idx) {
 
 // --- 4. Main Execution ---
 int main(void) {
-    // 1. Allocate arrays for both tests
+    // 1. Allocate arrays for both tests + a baseline array to reset data every loop
+    int* baseline_array = (int*)malloc(ARRAY_SIZE * sizeof(int));
     sort_payload seq_payload, conc_payload;
     seq_payload.array = (int*)malloc(ARRAY_SIZE * sizeof(int));
     seq_payload.temp_array = (int*)malloc(ARRAY_SIZE * sizeof(int));
     conc_payload.array = (int*)malloc(ARRAY_SIZE * sizeof(int));
     conc_payload.temp_array = (int*)malloc(ARRAY_SIZE * sizeof(int));
 
-    if (!seq_payload.array || !conc_payload.array) {
+    if (!seq_payload.array || !conc_payload.array || !baseline_array) {
         fprintf(stderr, "Fatal: Memory allocation failed.\n");
         return 1;
     }
 
-    // 2. Seed the arrays identically
-    srand(time(NULL));
+    // 2. Seed the baseline array once
+    srand((unsigned int)time(NULL));
     for (size_t i = 0; i < ARRAY_SIZE; i++) {
-        int val = rand() % 1000000;
-        seq_payload.array[i] = val;
-        conc_payload.array[i] = val;
+        baseline_array[i] = rand() % 1000000;
     }
 
-    printf("=== Starting Sort Benchmark (%d elements) ===\n\n", ARRAY_SIZE);
-    struct timespec start, end;
+    // Metrics Tracking
+    long long seq_min_us = INT64_MAX, seq_max_us = 0, seq_sum_us = 0;
+    long long conc_min_us = INT64_MAX, conc_max_us = 0, conc_sum_us = 0;
+    bool all_valid = true;
 
-    // ---------------------------------------------------------
-    // TEST A: Standard Sequential Sort
-    // ---------------------------------------------------------
-    printf("[1/2] Running standard sequential merge sort...\n");
-    clock_gettime(CLOCK_MONOTONIC, &start);
+    printf("=== Starting Sort Benchmark (%d elements, %d runs) ===\n\n", ARRAY_SIZE, NUM_RUNS);
     
-    sequential_merge_sort(seq_payload.array, seq_payload.temp_array, 0, ARRAY_SIZE);
-    
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    long long seq_elapsed_us = (end.tv_sec - start.tv_sec) * 1000000LL + (end.tv_nsec - start.tv_nsec) / 1000LL;
+    // Boot the scheduler once before the benchmark loop
+    scheduler_boot(1024, 4096);
 
-    // ---------------------------------------------------------
-    // TEST B: Lock-Free Concurrent Sort
-    // ---------------------------------------------------------
-    printf("[2/2] Running lock-free concurrent merge sort...\n");
-    scheduler_boot(1024,4096);
-    
-    sc_job sort_job;
-    scheduler_init_job(&sort_job, &conc_payload, ARRAY_SIZE, concurrent_merge_sort);
+    for (int run = 0; run < NUM_RUNS; run++) {
+        // CLI Progress indicator (overwrites the same line)
+        printf("\rExecuting run %d of %d...", run + 1, NUM_RUNS);
+        fflush(stdout);
 
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    
-    if (!scheduler_submit_job(&sort_job, ARRAY_SIZE)) {
-        fprintf(stderr, "Hardware backpressure: Job rejected.\n");
-        return 1;
-    }
+        // Reset arrays to identical unsorted states
+        memcpy(seq_payload.array, baseline_array, ARRAY_SIZE * sizeof(int));
+        memcpy(conc_payload.array, baseline_array, ARRAY_SIZE * sizeof(int));
 
-    scheduler_wait_for_job(&sort_job);
+        struct timespec start, end;
 
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    long long conc_elapsed_us = (end.tv_sec - start.tv_sec) * 1000000LL + (end.tv_nsec - start.tv_nsec) / 1000LL;
-    scheduler_stop_workers();
+        // ---------------------------------------------------------
+        // TEST A: Standard Sequential Sort
+        // ---------------------------------------------------------
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        sequential_merge_sort(seq_payload.array, seq_payload.temp_array, 0, ARRAY_SIZE);
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        
+        long long seq_elapsed = (end.tv_sec - start.tv_sec) * 1000000LL + (end.tv_nsec - start.tv_nsec) / 1000LL;
+        if (seq_elapsed < seq_min_us) seq_min_us = seq_elapsed;
+        if (seq_elapsed > seq_max_us) seq_max_us = seq_elapsed;
+        seq_sum_us += seq_elapsed;
 
-    // ---------------------------------------------------------
-    // Validation & Reporting
-    // ---------------------------------------------------------
-    bool is_sorted = true;
-    for (size_t i = 0; i < ARRAY_SIZE - 1; i++) {
-        if (conc_payload.array[i] > conc_payload.array[i + 1] || seq_payload.array[i] > seq_payload.array[i + 1]) {
-            is_sorted = false;
+        // ---------------------------------------------------------
+        // TEST B: Lock-Free Concurrent Sort
+        // ---------------------------------------------------------
+        sc_job sort_job;
+        scheduler_init_job(&sort_job, &conc_payload, ARRAY_SIZE, concurrent_merge_sort);
+
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        if (!scheduler_submit_job(&sort_job, ARRAY_SIZE)) {
+            fprintf(stderr, "\nHardware backpressure: Job rejected on run %d.\n", run + 1);
+            return 1;
+        }
+        scheduler_wait_for_job(&sort_job);
+        clock_gettime(CLOCK_MONOTONIC, &end);
+
+        long long conc_elapsed = (end.tv_sec - start.tv_sec) * 1000000LL + (end.tv_nsec - start.tv_nsec) / 1000LL;
+        if (conc_elapsed < conc_min_us) conc_min_us = conc_elapsed;
+        if (conc_elapsed > conc_max_us) conc_max_us = conc_elapsed;
+        conc_sum_us += conc_elapsed;
+
+        // ---------------------------------------------------------
+        // Validation per run
+        // ---------------------------------------------------------
+        for (size_t i = 0; i < ARRAY_SIZE - 1; i++) {
+            if (conc_payload.array[i] > conc_payload.array[i + 1] || seq_payload.array[i] > seq_payload.array[i + 1]) {
+                all_valid = false;
+                break;
+            }
+        }
+
+        if (!all_valid) {
+            printf("\n\nVALIDATION FAILED on run %d!\n", run + 1);
             break;
         }
     }
 
-    if (is_sorted) {
-        float speedup = (float)seq_elapsed_us / (float)conc_elapsed_us;
-        printf("\n=== Execution Statistics ===\n");
-        printf("Validation       : SUCCESS\n");
-        printf("Sequential Time  : %.2f ms\n", seq_elapsed_us / 1000.0f);
-        printf("Concurrent Time  : %.2f ms\n", conc_elapsed_us / 1000.0f);
-        printf("Speedup Multiplier: %.2fx Faster\n", speedup);
-    } else {
-        printf("\nVALIDATION FAILED!\n");
+    // Stop workers after all runs complete
+    scheduler_stop_workers();
+    printf("\n\n");
+
+    // ---------------------------------------------------------
+    // Reporting
+    // ---------------------------------------------------------
+    if (all_valid) {
+        float seq_avg_ms = (seq_sum_us / (float)NUM_RUNS) / 1000.0f;
+        float conc_avg_ms = (conc_sum_us / (float)NUM_RUNS) / 1000.0f;
+        float avg_speedup = seq_avg_ms / conc_avg_ms;
+
+        printf("=== Final Execution Statistics (%d Runs) ===\n", NUM_RUNS);
+        printf("Validation       : SUCCESS\n\n");
+        
+        printf("--- Sequential ---\n");
+        printf("Average Time     : %.2f ms\n", seq_avg_ms);
+        printf("Fastest Run      : %.2f ms\n", seq_min_us / 1000.0f);
+        printf("Slowest Run      : %.2f ms\n\n", seq_max_us / 1000.0f);
+
+        printf("--- Concurrent (sk-scheduler) ---\n");
+        printf("Average Time     : %.2f ms\n", conc_avg_ms);
+        printf("Fastest Run      : %.2f ms\n", conc_min_us / 1000.0f);
+        printf("Slowest Run      : %.2f ms\n\n", conc_max_us / 1000.0f);
+        
+        printf("--- Net Result ---\n");
+        printf("Average Speedup  : %.2fx Faster\n", avg_speedup);
     }
 
+    free(baseline_array);
     free(seq_payload.array); free(seq_payload.temp_array);
     free(conc_payload.array); free(conc_payload.temp_array);
     return 0;

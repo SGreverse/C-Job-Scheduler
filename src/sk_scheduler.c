@@ -27,7 +27,7 @@
 
 // global memory pool,allocated at boot
 alignas(64) atomic_uint_least64_t global_pool_head;
-sc_task* global_task_array = NULL;
+alignas(64) sc_task* global_task_array = NULL;
 size_t global_task_capacity = 0;
 
 //every thread has his own cache of tasks 
@@ -348,6 +348,7 @@ void scheduler_spawn_subtasks(void* payload, size_t start_idx, size_t end_idx, s
             
             size_t remaining_start = start_idx + ((chunks_processed + successfully_allocated) * chunk_size);
             if (remaining_start < end_idx) {
+                //inline execution of the entire chunk left
                 task_fn(payload, remaining_start, end_idx);
             }
             return;
