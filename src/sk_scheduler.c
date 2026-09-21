@@ -37,7 +37,7 @@ _Thread_local size_t task_cache_count = 0;
 sc_worker* worker_pool=NULL;
 
 //robin round counter for worker
-static atomic_size_t rr_worker_index = ATOMIC_VAR_INIT(0);
+static atomic_size_t rr_worker_index = 0;
 
 extern _Thread_local sc_worker* tl_current_worker;
 extern _Thread_local sc_task* tl_current_task;
