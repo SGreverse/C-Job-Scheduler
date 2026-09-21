@@ -54,10 +54,10 @@ if you installed everything and still found problems, you can try looking into t
 Here is a minimal example of booting the engine, dispatching a job, and waiting for it to finish.
 
 ```c
-#include <stdio.h>
-
 #define SK_SCHEDULER_IMPLEMENTATION
 #include "sk_scheduler.h"
+
+#include <stdio.h>
 
 // 1. Define the function your tasks will execute
 void simple_task(void* user_data, size_t start_idx, size_t end_idx) {
