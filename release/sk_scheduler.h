@@ -213,21 +213,6 @@ sc_task* chase_lev_steal(sc_cl_deque* victim_deque);
 
 
 
-typedef struct {
-    // external thread exclusive cache line 
-    alignas(64) atomic_size_t tail;
-    size_t head_cache; // local cache to prevent true sharing memory reads
-    
-    // wroker exclusive cache line
-    alignas(64) atomic_size_t head;
-    size_t tail_cache;
-    
-    size_t capacity_mask; // capacity - 1 for bitwise wrapping
-
-    sc_task** buffer;     
-
-} sc_spsc_queue;
-
 typedef struct{
     
     alignas(64) size_t core_id;
@@ -433,8 +418,6 @@ extern size_t get_cpu_logical_proccessors(void);
 extern void memory_pool_release(sc_task* task);
 
 
-
-
 static inline sc_task* spsc_consumer_pop(sc_worker* worker) {
     size_t current_head = atomic_load_explicit(&worker->rb_head, memory_order_relaxed);
     
@@ -448,12 +431,6 @@ static inline sc_task* spsc_consumer_pop(sc_worker* worker) {
     sc_task* task = worker->rb_buffer[current_head & worker->rb_capacity_mask];
     atomic_store_explicit(&worker->rb_head, current_head + 1, memory_order_release);
     return task;
-}
-void spsc_destroy(sc_spsc_queue* spsc_queue) {
-    if (spsc_queue->buffer != NULL) {
-        free(spsc_queue->buffer);
-        spsc_queue->buffer = NULL;
-    }
 }
 
 static inline void pin_thread_to_core(size_t core_id) {

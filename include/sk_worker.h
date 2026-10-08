@@ -17,21 +17,6 @@
 #include "sk_task.h"
 
 
-typedef struct {
-    // external thread exclusive cache line 
-    alignas(64) atomic_size_t tail;
-    size_t head_cache; // local cache to prevent true sharing memory reads
-    
-    // wroker exclusive cache line
-    alignas(64) atomic_size_t head;
-    size_t tail_cache;
-    
-    size_t capacity_mask; // capacity - 1 for bitwise wrapping
-
-    sc_task** buffer;     
-
-} sc_spsc_queue;
-
 typedef struct{
     
     alignas(64) size_t core_id;
