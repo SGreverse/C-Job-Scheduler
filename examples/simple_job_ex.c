@@ -38,7 +38,7 @@ int main(void) {
         return 1;
     }
 
-    //option 1: built in method( implemented for optimization)
+    //option 1: built in method( implemented for main waiting optimizaiton)
     scheduler_wait_for_job(&message_job);
 
     //option 2: use a while loop with the built in cpu_relax() 

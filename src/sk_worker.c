@@ -18,13 +18,14 @@
 #endif
 #include "sk_scheduler.h"
 #include "sk_worker.h"
-#include "sk_memory_utils.h"
 #include "sk_task.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdatomic.h>
 
 
+extern sc_worker* worker_pool;
+extern size_t global_worker_count;
 
 _Thread_local sc_worker* tl_current_worker = NULL;
 _Thread_local sc_task* tl_current_task = NULL;
@@ -38,11 +39,8 @@ static inline uint32_t xorshift32(uint32_t* state) {
     return *state = x;
 }
 
-extern sc_worker* worker_pool;
-extern size_t get_cpu_logical_proccessors(void);
-extern void memory_pool_release(sc_task* task);
 
-
+//pops from the worker's spsc queue 
 static inline sc_task* spsc_consumer_pop(sc_worker* worker) {
     size_t current_head = atomic_load_explicit(&worker->rb_head, memory_order_relaxed);
     
@@ -93,7 +91,7 @@ sc_worker* allocate_worker_pool(size_t logical_proccessors_amount,size_t spsc_qu
     sc_worker* pool = (sc_worker*)sys_aligned_alloc(64, logical_proccessors_amount * sizeof(sc_worker));
     
     if (!pool) {
-        fprintf(stderr, "Fatal Hardware Error: Failed to allocate aligned worker pool.\n");
+        fprintf(stderr, ": Failed to allocate aligned worker pool.\n");
         exit(EXIT_FAILURE);
     }
 
@@ -130,7 +128,7 @@ void* worker_main_loop(void* arg) {
     tl_current_worker = local_worker; 
     
     uint32_t rng_state = (uint32_t)(local_worker->core_id + 1) * 2654435761U;
-    size_t total_cores = get_cpu_logical_proccessors();
+    size_t total_cores = global_worker_count;
     if (total_cores < 1){
         total_cores = 1;
         printf("Bitch ass cpu core sys call \n");
@@ -151,15 +149,12 @@ void* worker_main_loop(void* arg) {
 
         //steal work
         if (!tl_current_task) {
-            // sleect random worker id
-            uint64_t random_32 = (uint64_t)xorshift32(&rng_state);
-            size_t victim_id = (size_t)((random_32 * (uint64_t)total_cores) >> 32);
-            
-            if (victim_id != local_worker->core_id) {
-                sc_cl_deque* victim_deque = &worker_pool[victim_id].cl_deque;
-                
-
-                tl_current_task = chase_lev_steal(victim_deque);
+            if (!tl_current_task && total_cores > 1) {
+                size_t victim_id = xorshift32(&rng_state) % (total_cores - 1);
+                if (victim_id >= local_worker->core_id) {
+                    victim_id++; // Uniformly maps [0 .. N-2] to all cores except local_worker->core_id!
+                }
+                tl_current_task = chase_lev_steal(&worker_pool[victim_id].cl_deque);
             }
         }
 
@@ -167,10 +162,13 @@ void* worker_main_loop(void* arg) {
             cpu_relax();
             continue;
         }
+        
+        sc_task_fn current_fn = tl_current_task->task_fn;
+        tl_current_task->task_fn = NULL;
 
-        //executes the function
-        tl_current_task->task_fn(tl_current_task->task_payload, tl_current_task->start_inx, tl_current_task->end_inx);
-
+        // execute the function
+        current_fn(tl_current_task->task_payload, tl_current_task->start_inx, tl_current_task->end_inx);
+        
         //drop the virtual lock
         size_t remaining_deps = atomic_fetch_sub_explicit(
             &tl_current_task->unfinished_dependencies, 
@@ -178,36 +176,85 @@ void* worker_main_loop(void* arg) {
             memory_order_acq_rel
         );
 
+        // the loop allows chaining of continuation and spawn sub task
+        //meaning continuation function can also spawn sub tasks infinitly without any problems
         if (remaining_deps == 1) {
-            sc_task* parent = tl_current_task->parent_task;
-            memory_pool_release(tl_current_task); // Safely recycle the child immediately
-
-            // Traverse the DAG to resolve cascading unparks without dropping pointers
-            while (parent != NULL) {
-                size_t prev_parent = atomic_fetch_sub_explicit(
-                    &parent->unfinished_dependencies, 1, memory_order_release
+            // all children spawned by current_fn already finished while current_fn was running
+            // If current_fn registered a continuation, run it right now inline.
+            while (tl_current_task->task_fn != NULL) {
+                sc_task_fn continuation_fn = tl_current_task->task_fn;
+                tl_current_task->task_fn = NULL;
+                atomic_store_explicit(&tl_current_task->unfinished_dependencies, 1, memory_order_relaxed);
+                
+                continuation_fn(tl_current_task->task_payload, tl_current_task->start_inx, tl_current_task->end_inx);
+                
+                remaining_deps = atomic_fetch_sub_explicit(
+                    &tl_current_task->unfinished_dependencies, 
+                    1, 
+                    memory_order_acq_rel
                 );
+                if (remaining_deps != 1) {
+                    break; // if continuation spawned new children that are still running , break and wait for them to finish
+                }
+            }
 
-                if (prev_parent == 1) {
-                    atomic_thread_fence(memory_order_acquire);
-                    atomic_store_explicit(&parent->unfinished_dependencies, 1, memory_order_relaxed);
+            if (remaining_deps == 1) {
+                sc_task* parent = tl_current_task->parent_task;
+                memory_pool_release(tl_current_task);
 
-                    if (!chase_lev_push(&local_worker->cl_deque, parent)) {
-                        // execute inline when deque is full
+                // Traverse the DAG to resolve cascading unparks
+                while (parent != NULL) {
+                    size_t parent_dependencies = atomic_fetch_sub_explicit(
+                        &parent->unfinished_dependencies, 1, memory_order_acq_rel
+                    );
+
+                    if (parent_dependencies != 1) {
+                        // parent still has other unfinished children or hasnt dropped its virtual lock yet
+                        break;
+                    }
+
+                    // this is the last dependency of the parent
+                    // check if it has a continuation function to run(same process as before)
+                    while (parent->task_fn != NULL) {
+                        atomic_store_explicit(&parent->unfinished_dependencies, 1, memory_order_relaxed);
+
+                        if (chase_lev_push(&local_worker->cl_deque, parent)) {
+                            // Successfully scheduled parent's continuation on our deque!
+                            parent = NULL;
+                            break;
+                        }
+
+                        // Deque is full: execute parent's continuation inline
                         tl_current_task = parent;
-                        parent->task_fn(
+                        sc_task_fn parent_fn = parent->task_fn;
+                        parent->task_fn = NULL;
+
+                        parent_fn(
                             parent->task_payload, 
                             parent->start_inx, 
                             parent->end_inx
                         );
-                        
-                        sc_task* next_parent = parent->parent_task;
-                        memory_pool_release(parent);
-                        parent = next_parent;
-                        continue;
+
+                        size_t parent_rem = atomic_fetch_sub_explicit(
+                            &parent->unfinished_dependencies, 1, memory_order_acq_rel
+                        );
+                        if (parent_rem != 1) {
+                            // Parent's continuation spawned new async children, stop traversing the DAG
+                            parent = NULL;
+                            break;
+                        }
                     }
+
+                    if (parent == NULL) {
+                        break;
+                    }
+
+                    // parent has no continuation left, so it is completely done 
+                    // so recycle it and continue to the enxt parent
+                    sc_task* next_parent = parent->parent_task;
+                    memory_pool_release(parent);
+                    parent = next_parent;
                 }
-                break;
             }
         }
     }
@@ -233,9 +280,6 @@ void no_op_continuation(void* payload, size_t start_idx, size_t end_idx) {
 //splits the job into tasks into 2 halfs and keeps pushing right task to deque, until the payload size is smaller then chunk size
 void internal_macro_job_splitter(void* payload, size_t start_idx, size_t end_idx) {
     sc_job* job = (sc_job*)payload;
-
-    // root task handles the completion
-    scheduler_set_continuation(no_op_continuation);
 
     while ((end_idx - start_idx) > job->chunk_size) {
         size_t total_elements = end_idx - start_idx;

@@ -57,7 +57,7 @@ void scheduler_init_job(sc_job* empty_job,void* payload,size_t payload_size,sc_j
 bool scheduler_submit_job(sc_job* job,size_t chunk_size);
 
 static inline bool scheduler_is_job_complete(sc_job* job) {
-    return atomic_load(&job->is_done);
+    return atomic_load_explicit(&job->is_done, memory_order_acquire);
 }
 
 //sets what the parent task will execute after the child tasks that he spawned finish and parent task will start executing again
@@ -85,7 +85,7 @@ void scheduler_wait_for_job(sc_job* job);
 #include <stdint.h>
 #include <stddef.h>
 
-//aligns the pointer so that it would fit the aligment requirement
+//aligns the pointer so that it would fit the aligment requirement.
 //must use sys_aligned_free() to free it
 static inline void* sys_aligned_alloc(size_t alignment, size_t size) {
     size_t offset = alignment - 1 + sizeof(void*);
@@ -170,30 +170,158 @@ void memory_pool_release(sc_task* task) ;
 /* --- sk_cl_deque.h --- */
 #pragma once
 
+
 #include <stdalign.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 
 typedef struct{
     alignas(64) atomic_int_least64_t top;
     
     alignas(64) atomic_int_least64_t bottom;
-
-    sc_task** buffer;
+    //since top and bottom only increments, the top cache will always be an overestimation
+    //of how full the deque is, which is useful for pushing when we dont want to always load the actual top
+    int64_t top_cache;
+    
+    alignas(64) sc_task** buffer;
 
     int64_t capacity_mask;
 
 }sc_cl_deque;
 
-void chase_lev_init(sc_cl_deque* deque, int64_t deque_size);
 
-//owner operations
-bool chase_lev_push(sc_cl_deque* deque, sc_task* task);
-sc_task* chase_lev_pop(sc_cl_deque* deque);
-size_t chase_lev_push_batch(sc_cl_deque* deque, sc_task** tasks, size_t count);
-// thief operation 
-sc_task* chase_lev_steal(sc_cl_deque* victim_deque);
+static inline void chase_lev_init(sc_cl_deque* deque, int64_t deque_size) {
+    int64_t actual_size = (int64_t)next_power_of_two((size_t)deque_size);
+    
+    deque->capacity_mask = actual_size - 1;
+    deque->top_cache=0;
+
+    atomic_init(&deque->top, 0);
+    atomic_init(&deque->bottom, 0);
+    
+    
+    deque->buffer = (sc_task**)sys_aligned_alloc(64, actual_size * sizeof(sc_task*));
+    
+    if (!deque->buffer) {
+        fprintf(stderr, "Fatal Hardware Error: Failed to allocate aligned Chase-Lev buffer.\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+static inline bool chase_lev_push(sc_cl_deque *deque, sc_task *task){
+    int64_t b=atomic_load_explicit(&deque->bottom, memory_order_relaxed);
+
+
+    int64_t capacity = deque->capacity_mask+1;
+
+    //since t and b only increments, the top cache will always be an overestimation
+    //of how full the 
+    if(b-deque->top_cache>=capacity){
+        deque->top_cache= atomic_load_explicit(&deque->top, memory_order_relaxed);
+        if (b - deque->top_cache >= capacity) return false;
+    }
+
+
+    deque->buffer[b & deque->capacity_mask]=task;
+
+    atomic_store_explicit(&deque->bottom, b + 1, memory_order_release);
+
+    return true;
+}
+
+static inline size_t chase_lev_push_batch(sc_cl_deque* deque, sc_task** tasks, size_t count) {
+    if (count == 0) return 0;
+
+    int64_t b = atomic_load_explicit(&deque->bottom, memory_order_relaxed);
+   int64_t capacity = deque->capacity_mask + 1;
+
+    int64_t available = capacity - (b - deque->top_cache);
+    if (available < (int64_t)count) {
+        // refresh top_cache only if there isnt enough room for the whole batch
+        deque->top_cache = atomic_load_explicit(&deque->top, memory_order_relaxed);
+        available = capacity - (b - deque->top_cache);
+        if (available <= 0) return 0;
+    }
+
+    size_t push_count = (size_t)(available < (int64_t)count ? available : (int64_t)count);
+
+    
+    for (size_t i = 0; i < push_count; i++) {
+        deque->buffer[(b + i) & deque->capacity_mask] = tasks[i];
+    }
+
+    atomic_store_explicit(&deque->bottom, b + push_count, memory_order_release);
+
+    return push_count;
+}
+
+static inline sc_task* chase_lev_pop(sc_cl_deque* deque) {
+    int64_t b = atomic_load_explicit(&deque->bottom, memory_order_relaxed);
+    int64_t t = atomic_load_explicit(&deque->top, memory_order_relaxed);
+
+    // if deque already empty(since its his deque we dont need to check further since noone else can push)
+    if (b <= t) {
+        return NULL;
+    }
+    //decrememnt bottom
+    b--;
+    atomic_store_explicit(&deque->bottom, b, memory_order_relaxed);
+    atomic_thread_fence(memory_order_seq_cst);
+
+    t = atomic_load_explicit(&deque->top, memory_order_relaxed);
+    int64_t size = b - t;
+    
+    if (size < 0) {
+        atomic_store_explicit(&deque->bottom, t, memory_order_relaxed);
+        return NULL;
+    }
+    sc_task* task = deque->buffer[b & deque->capacity_mask];
+
+    if (size > 0) return task;
+
+    int64_t expected_t = t;
+    // attempt CAS race against any thieves
+    bool won_race = atomic_compare_exchange_strong_explicit(
+        &deque->top, 
+        &expected_t, 
+        t + 1, 
+        memory_order_seq_cst, 
+        memory_order_relaxed
+    );
+    
+    //if CAS failed, thief got the item first
+    if (!won_race) task=NULL;
+    
+    
+    atomic_store_explicit(&deque->bottom, t + 1, memory_order_relaxed);
+    
+    return task;
+}
+
+static inline sc_task* chase_lev_steal(sc_cl_deque *victim_deque){
+    int64_t t = atomic_load_explicit(&victim_deque->top, memory_order_acquire);
+    atomic_thread_fence(memory_order_seq_cst);
+    int64_t b = atomic_load_explicit(&victim_deque->bottom, memory_order_acquire);
+
+    if (b <= t) {
+        return NULL;
+    }
+
+    sc_task* task= victim_deque->buffer[t & victim_deque->capacity_mask];
+    
+    //if CAS faield, thief got the item first
+    if (!atomic_compare_exchange_strong_explicit(
+        &victim_deque->top, 
+        &t, 
+        t + 1, 
+        memory_order_seq_cst, 
+        memory_order_relaxed)) return NULL;
+
+    return task;
+
+}
 
 /* --- sk_worker.h --- */
 #pragma once
@@ -241,140 +369,6 @@ sc_worker* allocate_worker_pool(size_t logical_proccessors_amount,size_t spsc_qu
 void* worker_main_loop(void* worker);
 
 
-/* --- sk_cl_deque.c --- */
-
-
-#include <stdatomic.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <stdlib.h>
-#include <stdio.h>
-
-
-void chase_lev_init(sc_cl_deque* deque, int64_t deque_size) {
-    int64_t actual_size = (int64_t)next_power_of_two((size_t)deque_size);
-    
-    deque->capacity_mask = actual_size - 1;
-    
-    atomic_init(&deque->top, 0);
-    atomic_init(&deque->bottom, 0);
-    
-    
-    deque->buffer = (sc_task**)sys_aligned_alloc(64, actual_size * sizeof(sc_task*));
-    
-    if (!deque->buffer) {
-        fprintf(stderr, "Fatal Hardware Error: Failed to allocate aligned Chase-Lev buffer.\n");
-        exit(EXIT_FAILURE);
-    }
-}
-
-bool chase_lev_push(sc_cl_deque *deque, sc_task *task){
-    int64_t b=atomic_load_explicit(&deque->bottom, memory_order_relaxed);
-
-    int64_t t = atomic_load_explicit(&deque->top, memory_order_acquire);
-
-    int64_t capacity = deque->capacity_mask+1;
-
-    if (b - t >= capacity) return false;
-
-
-    deque->buffer[b & deque->capacity_mask]=task;
-
-    atomic_store_explicit(&deque->bottom, b + 1, memory_order_release);
-
-    return true;
-}
-
-size_t chase_lev_push_batch(sc_cl_deque* deque, sc_task** tasks, size_t count) {
-    if (count == 0) return 0;
-
-    int64_t b = atomic_load_explicit(&deque->bottom, memory_order_relaxed);
-    
-    int64_t t = atomic_load_explicit(&deque->top, memory_order_acquire);
-    int64_t capacity = deque->capacity_mask + 1;
-
-    int64_t available = capacity - (b - t);
-    if (available <= 0) return 0;
-
-    size_t push_count = (size_t)(available < (int64_t)count ? available : (int64_t)count);
-
-    
-    for (size_t i = 0; i < push_count; i++) {
-        deque->buffer[(b + i) & deque->capacity_mask] = tasks[i];
-    }
-
-    atomic_store_explicit(&deque->bottom, b + push_count, memory_order_release);
-
-    return push_count;
-}
-
-sc_task* chase_lev_pop(sc_cl_deque* deque) {
-    //decrememnt bottom
-    int64_t b = atomic_load_explicit(&deque->bottom, memory_order_relaxed) - 1;
-    
-    atomic_store_explicit(&deque->bottom, b, memory_order_relaxed);
-    
-    atomic_thread_fence(memory_order_seq_cst);
-
-    int64_t t = atomic_load_explicit(&deque->top, memory_order_relaxed);
-    
-    int64_t size = b - t;
-    
-    if (size < 0) {
-        atomic_store_explicit(&deque->bottom, t, memory_order_relaxed);
-        return NULL;
-    }
-    sc_task* task = deque->buffer[b & deque->capacity_mask];
-
-    if (size > 0) return task;
-
-    int64_t expected_t = t;
-    // attempt CAS race against any thieves
-    bool won_race = atomic_compare_exchange_strong_explicit(
-        &deque->top, 
-        &expected_t, 
-        t + 1, 
-        memory_order_seq_cst, 
-        memory_order_relaxed
-    );
-    
-    //if CAS failed, thief got the item first
-    if (!won_race) task=NULL;
-    
-    
-    atomic_store_explicit(&deque->bottom, t + 1, memory_order_relaxed);
-    
-    return task;
-}
-
-sc_task* chase_lev_steal(sc_cl_deque *victim_deque){
-    int64_t t = atomic_load_explicit(&victim_deque->top, memory_order_seq_cst);
-    
-    int64_t b = atomic_load_explicit(&victim_deque->bottom, memory_order_acquire);
-
-    int64_t size=b-t;
-
-    if(size<=0) {
-        return NULL;
-    }
-
-    sc_task* task= victim_deque->buffer[t & victim_deque->capacity_mask];
-
-    bool won_race = atomic_compare_exchange_strong_explicit(
-        &victim_deque->top, 
-        &t, 
-        t + 1, 
-        memory_order_seq_cst, 
-        memory_order_relaxed
-    );
-    
-    //if CAS faield, thief got the item first
-    if (!won_race) return NULL;
-
-    return task;
-
-}
 
 /* --- sk_worker.c --- */
 #if defined(__linux__)
@@ -400,6 +394,8 @@ sc_task* chase_lev_steal(sc_cl_deque *victim_deque){
 #include <stdatomic.h>
 
 
+extern sc_worker* worker_pool;
+extern size_t global_worker_count;
 
 _Thread_local sc_worker* tl_current_worker = NULL;
 _Thread_local sc_task* tl_current_task = NULL;
@@ -413,11 +409,8 @@ static inline uint32_t xorshift32(uint32_t* state) {
     return *state = x;
 }
 
-extern sc_worker* worker_pool;
-extern size_t get_cpu_logical_proccessors(void);
-extern void memory_pool_release(sc_task* task);
 
-
+//pops from the worker's spsc queue 
 static inline sc_task* spsc_consumer_pop(sc_worker* worker) {
     size_t current_head = atomic_load_explicit(&worker->rb_head, memory_order_relaxed);
     
@@ -468,7 +461,7 @@ sc_worker* allocate_worker_pool(size_t logical_proccessors_amount,size_t spsc_qu
     sc_worker* pool = (sc_worker*)sys_aligned_alloc(64, logical_proccessors_amount * sizeof(sc_worker));
     
     if (!pool) {
-        fprintf(stderr, "Fatal Hardware Error: Failed to allocate aligned worker pool.\n");
+        fprintf(stderr, ": Failed to allocate aligned worker pool.\n");
         exit(EXIT_FAILURE);
     }
 
@@ -505,7 +498,7 @@ void* worker_main_loop(void* arg) {
     tl_current_worker = local_worker; 
     
     uint32_t rng_state = (uint32_t)(local_worker->core_id + 1) * 2654435761U;
-    size_t total_cores = get_cpu_logical_proccessors();
+    size_t total_cores = global_worker_count;
     if (total_cores < 1){
         total_cores = 1;
         printf("Bitch ass cpu core sys call \n");
@@ -526,15 +519,12 @@ void* worker_main_loop(void* arg) {
 
         //steal work
         if (!tl_current_task) {
-            // sleect random worker id
-            uint64_t random_32 = (uint64_t)xorshift32(&rng_state);
-            size_t victim_id = (size_t)((random_32 * (uint64_t)total_cores) >> 32);
-            
-            if (victim_id != local_worker->core_id) {
-                sc_cl_deque* victim_deque = &worker_pool[victim_id].cl_deque;
-                
-
-                tl_current_task = chase_lev_steal(victim_deque);
+            if (!tl_current_task && total_cores > 1) {
+                size_t victim_id = xorshift32(&rng_state) % (total_cores - 1);
+                if (victim_id >= local_worker->core_id) {
+                    victim_id++; // Uniformly maps [0 .. N-2] to all cores except local_worker->core_id!
+                }
+                tl_current_task = chase_lev_steal(&worker_pool[victim_id].cl_deque);
             }
         }
 
@@ -542,10 +532,13 @@ void* worker_main_loop(void* arg) {
             cpu_relax();
             continue;
         }
+        
+        sc_task_fn current_fn = tl_current_task->task_fn;
+        tl_current_task->task_fn = NULL;
 
-        //executes the function
-        tl_current_task->task_fn(tl_current_task->task_payload, tl_current_task->start_inx, tl_current_task->end_inx);
-
+        // execute the function
+        current_fn(tl_current_task->task_payload, tl_current_task->start_inx, tl_current_task->end_inx);
+        
         //drop the virtual lock
         size_t remaining_deps = atomic_fetch_sub_explicit(
             &tl_current_task->unfinished_dependencies, 
@@ -553,36 +546,85 @@ void* worker_main_loop(void* arg) {
             memory_order_acq_rel
         );
 
+        // the loop allows chaining of continuation and spawn sub task
+        //meaning continuation function can also spawn sub tasks infinitly without any problems
         if (remaining_deps == 1) {
-            sc_task* parent = tl_current_task->parent_task;
-            memory_pool_release(tl_current_task); // Safely recycle the child immediately
-
-            // Traverse the DAG to resolve cascading unparks without dropping pointers
-            while (parent != NULL) {
-                size_t prev_parent = atomic_fetch_sub_explicit(
-                    &parent->unfinished_dependencies, 1, memory_order_release
+            // all children spawned by current_fn already finished while current_fn was running
+            // If current_fn registered a continuation, run it right now inline.
+            while (tl_current_task->task_fn != NULL) {
+                sc_task_fn continuation_fn = tl_current_task->task_fn;
+                tl_current_task->task_fn = NULL;
+                atomic_store_explicit(&tl_current_task->unfinished_dependencies, 1, memory_order_relaxed);
+                
+                continuation_fn(tl_current_task->task_payload, tl_current_task->start_inx, tl_current_task->end_inx);
+                
+                remaining_deps = atomic_fetch_sub_explicit(
+                    &tl_current_task->unfinished_dependencies, 
+                    1, 
+                    memory_order_acq_rel
                 );
+                if (remaining_deps != 1) {
+                    break; // if continuation spawned new children that are still running , break and wait for them to finish
+                }
+            }
 
-                if (prev_parent == 1) {
-                    atomic_thread_fence(memory_order_acquire);
-                    atomic_store_explicit(&parent->unfinished_dependencies, 1, memory_order_relaxed);
+            if (remaining_deps == 1) {
+                sc_task* parent = tl_current_task->parent_task;
+                memory_pool_release(tl_current_task);
 
-                    if (!chase_lev_push(&local_worker->cl_deque, parent)) {
-                        // execute inline when deque is full
+                // Traverse the DAG to resolve cascading unparks
+                while (parent != NULL) {
+                    size_t parent_dependencies = atomic_fetch_sub_explicit(
+                        &parent->unfinished_dependencies, 1, memory_order_acq_rel
+                    );
+
+                    if (parent_dependencies != 1) {
+                        // parent still has other unfinished children or hasnt dropped its virtual lock yet
+                        break;
+                    }
+
+                    // this is the last dependency of the parent
+                    // check if it has a continuation function to run(same process as before)
+                    while (parent->task_fn != NULL) {
+                        atomic_store_explicit(&parent->unfinished_dependencies, 1, memory_order_relaxed);
+
+                        if (chase_lev_push(&local_worker->cl_deque, parent)) {
+                            // Successfully scheduled parent's continuation on our deque!
+                            parent = NULL;
+                            break;
+                        }
+
+                        // Deque is full: execute parent's continuation inline
                         tl_current_task = parent;
-                        parent->task_fn(
+                        sc_task_fn parent_fn = parent->task_fn;
+                        parent->task_fn = NULL;
+
+                        parent_fn(
                             parent->task_payload, 
                             parent->start_inx, 
                             parent->end_inx
                         );
-                        
-                        sc_task* next_parent = parent->parent_task;
-                        memory_pool_release(parent);
-                        parent = next_parent;
-                        continue;
+
+                        size_t parent_rem = atomic_fetch_sub_explicit(
+                            &parent->unfinished_dependencies, 1, memory_order_acq_rel
+                        );
+                        if (parent_rem != 1) {
+                            // Parent's continuation spawned new async children, stop traversing the DAG
+                            parent = NULL;
+                            break;
+                        }
                     }
+
+                    if (parent == NULL) {
+                        break;
+                    }
+
+                    // parent has no continuation left, so it is completely done 
+                    // so recycle it and continue to the enxt parent
+                    sc_task* next_parent = parent->parent_task;
+                    memory_pool_release(parent);
+                    parent = next_parent;
                 }
-                break;
             }
         }
     }
@@ -608,9 +650,6 @@ void no_op_continuation(void* payload, size_t start_idx, size_t end_idx) {
 //splits the job into tasks into 2 halfs and keeps pushing right task to deque, until the payload size is smaller then chunk size
 void internal_macro_job_splitter(void* payload, size_t start_idx, size_t end_idx) {
     sc_job* job = (sc_job*)payload;
-
-    // root task handles the completion
-    scheduler_set_continuation(no_op_continuation);
 
     while ((end_idx - start_idx) > job->chunk_size) {
         size_t total_elements = end_idx - start_idx;
@@ -680,7 +719,7 @@ void internal_macro_job_splitter(void* payload, size_t start_idx, size_t end_idx
 #define POOL_EMPTY_INDEX 0xFFFFFFFF
 
 #define TASK_CACHE_CAPACITY 64
-
+#define TASK_EVICT_COUNT 32
 
 
 // global memory pool,allocated at boot
@@ -693,12 +732,13 @@ _Thread_local sc_task* task_cache[TASK_CACHE_CAPACITY];
 _Thread_local size_t task_cache_count = 0;
 
 sc_worker* worker_pool=NULL;
-
+size_t global_worker_count=0;
 //robin round counter for worker
 static atomic_size_t rr_worker_index = 0;
 
 extern _Thread_local sc_worker* tl_current_worker;
 extern _Thread_local sc_task* tl_current_task;
+
 
 
 
@@ -758,15 +798,22 @@ void memory_pool_release(sc_task* task) {
         return;
     }
     
-    // cache full, evict(is it evict or avict) the task cache
-    for (size_t i = 1; i < TASK_CACHE_CAPACITY; i++) {
+
+    // cache full, evict(is it evict or avict) half the task cache
+    const size_t start_evict = TASK_CACHE_CAPACITY - TASK_EVICT_COUNT;
+    for (size_t i = start_evict + 1; i < TASK_CACHE_CAPACITY; i++) {
         uint32_t prev_idx = (uint32_t)(task_cache[i - 1] - global_task_array);
-        task_cache[i]->next_free_idx = prev_idx;
+        atomic_store_explicit(&task_cache[i]->next_free_idx, prev_idx, memory_order_relaxed);
     }
 
     uint32_t current_task_idx = (uint32_t)(task - global_task_array);
-    task->next_free_idx = (uint32_t)(task_cache[TASK_CACHE_CAPACITY - 1] - global_task_array);
-    uint32_t tail_idx = (uint32_t)(task_cache[0] - global_task_array);
+    atomic_store_explicit(
+        &task->next_free_idx, 
+        (uint32_t)(task_cache[TASK_CACHE_CAPACITY - 1] - global_task_array), 
+        memory_order_relaxed
+    );
+
+    uint32_t tail_idx = (uint32_t)(task_cache[start_evict] - global_task_array);
 
     uint64_t current_head = atomic_load_explicit(&global_pool_head, memory_order_relaxed);
 
@@ -783,7 +830,7 @@ void memory_pool_release(sc_task* task) {
         cpu_relax();
     }
     
-    task_cache_count = 0;
+    task_cache_count = start_evict;
 }
 // gets the amount of logical hardware threads
 size_t get_cpu_logical_proccessors(void) {
@@ -821,9 +868,9 @@ void internal_macro_job_splitter(void* user_data, size_t start_idx, size_t end_i
 void hooked_job_finish_task(void* payload,size_t start_inx,size_t end_inx);
 
 void scheduler_boot(size_t spsc_queue_size,size_t cl_deque_size){
-    size_t lp_count=get_cpu_logical_proccessors();
-    if(lp_count<1){
-        lp_count=1;
+    global_worker_count=get_cpu_logical_proccessors();
+    if(global_worker_count<1){
+        global_worker_count=1;
         printf("Bitch ass cpu core sys call \n");
     }
 
@@ -856,12 +903,13 @@ void scheduler_boot(size_t spsc_queue_size,size_t cl_deque_size){
 
     
     //allocate all worker threads and run them
-    worker_pool=allocate_worker_pool(lp_count,spsc_queue_size,cl_deque_size);
+    worker_pool=allocate_worker_pool(global_worker_count,spsc_queue_size,cl_deque_size);
+    
     if(!worker_pool){
         fprintf(stderr, "Fatal Hardware Error: Failed to allocate worker pool.\n");
         return;
     }
-    for(size_t i=0;i<lp_count;i++){
+    for(size_t i=0;i<global_worker_count;i++){
         #if defined(_WIN32)
             worker_pool[i].thread_handler = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)worker_main_loop, &worker_pool[i], 0, NULL);
             if(!worker_pool[i].thread_handler){
@@ -922,15 +970,14 @@ bool scheduler_submit_job(sc_job* job,size_t chunk_size){
     child_task->parent_task = root_task; 
     atomic_store(&child_task->unfinished_dependencies, 1);
 
-    size_t worker_count = get_cpu_logical_proccessors();
-    if (worker_count < 1) worker_count = 1;
-    size_t target_idx = atomic_fetch_add_explicit(&rr_worker_index, 1, memory_order_relaxed) % worker_count;
+    size_t target_idx = atomic_fetch_add_explicit(&rr_worker_index, 1, memory_order_relaxed) % global_worker_count;
 
     bool success =spsc_producer_push(&worker_pool[target_idx], child_task);
 
     if (!success) {
         //if spsc if full, return the task to the pool
         memory_pool_release(root_task);
+        memory_pool_release(child_task);
         return false;
     }
 
@@ -1023,17 +1070,12 @@ void scheduler_set_continuation(sc_job_fn next_task){
 void scheduler_stop_workers(){
     if(!worker_pool) return;
 
-    size_t lp_count = get_cpu_logical_proccessors();
-    while(lp_count<1){
-        lp_count = get_cpu_logical_proccessors();
-        printf("Bitch ass cpu core sys call \n");
-    }
 
-    for (size_t i = 0; i < lp_count; i++) {
+    for (size_t i = 0; i < global_worker_count; i++) {
         atomic_store_explicit(&worker_pool[i].termination_flag, true, memory_order_release);
     }
 
-    for (size_t i = 0; i < lp_count; i++) {
+    for (size_t i = 0; i < global_worker_count; i++) {
         #if defined(_WIN32)
             WaitForSingleObject(worker_pool[i].thread_handler, INFINITE);
             CloseHandle(worker_pool[i].thread_handler);
@@ -1042,7 +1084,7 @@ void scheduler_stop_workers(){
         #endif
     }
 
-    for (size_t i = 0; i < lp_count; i++) {
+    for (size_t i = 0; i < global_worker_count; i++) {
         if (worker_pool[i].cl_deque.buffer) {
             sys_aligned_free(worker_pool[i].cl_deque.buffer);
         }
@@ -1082,13 +1124,14 @@ void scheduler_wait_for_job(sc_job* job) {
         } 
         else {
             #if defined(_WIN32)
-                Sleep((DWORD)(sleep_ns / 1000000));
+                Sleep(0);
             #else
                 struct timespec ts = {0, sleep_ns};
                 nanosleep(&ts, NULL);
             #endif
             
-            if (sleep_ns < 1000000) {
+            // Cap at 100 microseconds
+            if (sleep_ns < 100000) {
                 sleep_ns *= 2; 
             }
         }

@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 199309L
 #define SK_SCHEDULER_IMPLEMENTATION
 #include "sk_scheduler.h"
 
@@ -8,6 +9,7 @@
 #include <stdbool.h>
 
 #define ARRAY_SIZE 10000000
+#define CHUNK_SIZE 65536
 #define NUM_ITERATIONS 100
 
 typedef struct {
@@ -15,20 +17,25 @@ typedef struct {
     float multiplier;
 } math_payload;
 
-// The Lock-Free Execution Function
+static int compare_ll(const void* a, const void* b) {
+    long long arg1 = *(const long long*)a;
+    long long arg2 = *(const long long*)b;
+    return (arg1 > arg2) - (arg1 < arg2);
+}
+
 void process_array_chunk(void* user_data, size_t start_idx, size_t end_idx) {
     math_payload* payload = (math_payload*)user_data;
+    float* restrict arr = payload->data_array;
+    float mult = payload->multiplier;
     
-    // Process the contiguous memory chunk utilizing L1 spatial locality
-    for(size_t i = start_idx; i < end_idx; i++){
-        payload->data_array[i] = (float)i * payload->multiplier;
+    for (size_t i = start_idx; i < end_idx; i++) {
+        arr[i] = (float)i * mult;
     }
 }
 
 int main(void) {
-    printf("=== Array Processing Benchmark (%d elements, %d iterations) ===\n\n", ARRAY_SIZE, NUM_ITERATIONS);
+    printf("=== Isolated Array Processing Benchmark (%d elements, %d iterations) ===\n\n", ARRAY_SIZE, NUM_ITERATIONS);
 
-    // 1. Allocate payloads for both sequential and concurrent tests
     math_payload seq_payload, conc_payload;
     seq_payload.data_array = (float*)malloc(ARRAY_SIZE * sizeof(float));
     seq_payload.multiplier = 1.05f;
@@ -36,56 +43,62 @@ int main(void) {
     conc_payload.data_array = (float*)malloc(ARRAY_SIZE * sizeof(float));
     conc_payload.multiplier = 1.05f;
 
-    if (!seq_payload.data_array || !conc_payload.data_array) {
+    long long* seq_times = (long long*)malloc(NUM_ITERATIONS * sizeof(long long));
+    long long* conc_times = (long long*)malloc(NUM_ITERATIONS * sizeof(long long));
+
+    if (!seq_payload.data_array || !conc_payload.data_array || !seq_times || !conc_times) {
         fprintf(stderr, "Fatal: Memory allocation failed.\n");
         return 1;
     }
 
-    long long seq_total_us = 0, seq_min_us = INT64_MAX, seq_max_us = 0;
-    long long conc_total_us = 0, conc_min_us = INT64_MAX, conc_max_us = 0;
+    long long seq_total_us = 0, conc_total_us = 0;
     struct timespec start, end;
 
     // --- TEST 1: Sequential Execution ---
-    printf("[1/2] Running standard sequential loop...\n");
+    printf("[1/2] Benchmarking Sequential Baseline...\n");
+    // Warmup to fault in OS virtual memory pages before timing
+    for (int w = 0; w < 5; w++) {
+        process_array_chunk(&seq_payload, 0, ARRAY_SIZE);
+    }
+
     for (int i = 0; i < NUM_ITERATIONS; i++) {
         clock_gettime(CLOCK_MONOTONIC, &start);
-        
         process_array_chunk(&seq_payload, 0, ARRAY_SIZE);
-        
         clock_gettime(CLOCK_MONOTONIC, &end);
+
         long long elapsed_us = (end.tv_sec - start.tv_sec) * 1000000LL + (end.tv_nsec - start.tv_nsec) / 1000LL;
-        
+        seq_times[i] = elapsed_us;
         seq_total_us += elapsed_us;
-        if (elapsed_us < seq_min_us) seq_min_us = elapsed_us;
-        if (elapsed_us > seq_max_us) seq_max_us = elapsed_us;
     }
 
     // --- TEST 2: Lock-Free Concurrent Execution ---
-    printf("[2/2] Running lock-free scheduled job...\n");
-    
-    scheduler_boot(1024,4096);
+    printf("[2/2] Benchmarking Concurrent (sk-scheduler)...\n");
+    scheduler_boot(1024, 4096);
+
+    // Warmup to fault in pages and warm worker caches
+    for (int w = 0; w < 5; w++) {
+        sc_job warmup_job;
+        scheduler_init_job(&warmup_job, &conc_payload, ARRAY_SIZE, process_array_chunk);
+        scheduler_submit_job(&warmup_job, CHUNK_SIZE);
+        scheduler_wait_for_job(&warmup_job);
+    }
 
     for (int i = 0; i < NUM_ITERATIONS; i++) {
         sc_job math_job;
         scheduler_init_job(&math_job, &conc_payload, ARRAY_SIZE, process_array_chunk);
 
         clock_gettime(CLOCK_MONOTONIC, &start);
-
-        // Push the Job across the SPSC boundary, requesting L1-friendly chunks of 1024
-        if (!scheduler_submit_job(&math_job, 1000000)) {
+        if (!scheduler_submit_job(&math_job, CHUNK_SIZE)) {
             fprintf(stderr, "Hardware backpressure: SPSC ingestion rejected the job at iteration %d.\n", i);
             scheduler_stop_workers();
             return 1;
         }
-
         scheduler_wait_for_job(&math_job);
-
         clock_gettime(CLOCK_MONOTONIC, &end);
+
         long long elapsed_us = (end.tv_sec - start.tv_sec) * 1000000LL + (end.tv_nsec - start.tv_nsec) / 1000LL;
-        
+        conc_times[i] = elapsed_us;
         conc_total_us += elapsed_us;
-        if (elapsed_us < conc_min_us) conc_min_us = elapsed_us;
-        if (elapsed_us > conc_max_us) conc_max_us = elapsed_us;
     }
     
     scheduler_stop_workers();
@@ -102,19 +115,28 @@ int main(void) {
     }
 
     if (is_valid) {
-        long long seq_avg_us = seq_total_us / NUM_ITERATIONS;
-        long long conc_avg_us = conc_total_us / NUM_ITERATIONS;
-        float speedup = (float)seq_avg_us / (float)conc_avg_us;
+        qsort(seq_times, NUM_ITERATIONS, sizeof(long long), compare_ll);
+        qsort(conc_times, NUM_ITERATIONS, sizeof(long long), compare_ll);
+
+        long long seq_p50 = seq_times[NUM_ITERATIONS / 2];
+        long long conc_p50 = conc_times[NUM_ITERATIONS / 2];
 
         printf("\n=== Execution Statistics (%d Iterations) ===\n", NUM_ITERATIONS);
-        printf("Validation       : SUCCESS\n");
-        printf("Sequential Avg   : %lld us (Min: %lld, Max: %lld)\n", seq_avg_us, seq_min_us, seq_max_us);
-        printf("Concurrent Avg   : %lld us (Min: %lld, Max: %lld)\n", conc_avg_us, conc_min_us, conc_max_us);
-        printf("Speedup          : %.2fx Faster\n", speedup);
+        printf("Validation       : SUCCESS\n\n");
+        printf("--- Sequential ---\n");
+        printf("Median (P50)     : %lld us (P90: %lld us, P99: %lld us)\n", seq_p50, seq_times[(int)(NUM_ITERATIONS * 0.90)], seq_times[(int)(NUM_ITERATIONS * 0.99)]);
+        printf("Min / Max / Avg  : %lld us / %lld us / %lld us\n\n", seq_times[0], seq_times[NUM_ITERATIONS - 1], seq_total_us / NUM_ITERATIONS);
+
+        printf("--- Concurrent (sk-scheduler) ---\n");
+        printf("Median (P50)     : %lld us (P90: %lld us, P99: %lld us)\n", conc_p50, conc_times[(int)(NUM_ITERATIONS * 0.90)], conc_times[(int)(NUM_ITERATIONS * 0.99)]);
+        printf("Min / Max / Avg  : %lld us / %lld us / %lld us\n\n", conc_times[0], conc_times[NUM_ITERATIONS - 1], conc_total_us / NUM_ITERATIONS);
+
+        printf("--- Net Result ---\n");
+        printf("Median Speedup   : %.2fx Faster\n", (float)seq_p50 / (float)conc_p50);
     }
 
+    free(seq_times); free(conc_times);
     free(seq_payload.data_array);
     free(conc_payload.data_array);
-
     return 0;
 }

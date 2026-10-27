@@ -51,7 +51,7 @@ void scheduler_init_job(sc_job* empty_job,void* payload,size_t payload_size,sc_j
 bool scheduler_submit_job(sc_job* job,size_t chunk_size);
 
 static inline bool scheduler_is_job_complete(sc_job* job) {
-    return atomic_load(&job->is_done);
+    return atomic_load_explicit(&job->is_done, memory_order_acquire);
 }
 
 //sets what the parent task will execute after the child tasks that he spawned finish and parent task will start executing again

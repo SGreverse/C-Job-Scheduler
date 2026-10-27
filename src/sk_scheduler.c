@@ -8,7 +8,6 @@
     #include <windows.h>
 #endif
 
-#include "sk_memory_utils.h"
 #include "sk_scheduler.h"
 #include <stdatomic.h>
 #include <stdio.h>
@@ -22,7 +21,7 @@
 #define POOL_EMPTY_INDEX 0xFFFFFFFF
 
 #define TASK_CACHE_CAPACITY 64
-
+#define TASK_EVICT_COUNT 32
 
 
 // global memory pool,allocated at boot
@@ -35,12 +34,13 @@ _Thread_local sc_task* task_cache[TASK_CACHE_CAPACITY];
 _Thread_local size_t task_cache_count = 0;
 
 sc_worker* worker_pool=NULL;
-
+size_t global_worker_count=0;
 //robin round counter for worker
 static atomic_size_t rr_worker_index = 0;
 
 extern _Thread_local sc_worker* tl_current_worker;
 extern _Thread_local sc_task* tl_current_task;
+
 
 
 
@@ -100,15 +100,22 @@ void memory_pool_release(sc_task* task) {
         return;
     }
     
-    // cache full, evict(is it evict or avict) the task cache
-    for (size_t i = 1; i < TASK_CACHE_CAPACITY; i++) {
+
+    // cache full, evict(is it evict or avict) half the task cache
+    const size_t start_evict = TASK_CACHE_CAPACITY - TASK_EVICT_COUNT;
+    for (size_t i = start_evict + 1; i < TASK_CACHE_CAPACITY; i++) {
         uint32_t prev_idx = (uint32_t)(task_cache[i - 1] - global_task_array);
-        task_cache[i]->next_free_idx = prev_idx;
+        atomic_store_explicit(&task_cache[i]->next_free_idx, prev_idx, memory_order_relaxed);
     }
 
     uint32_t current_task_idx = (uint32_t)(task - global_task_array);
-    task->next_free_idx = (uint32_t)(task_cache[TASK_CACHE_CAPACITY - 1] - global_task_array);
-    uint32_t tail_idx = (uint32_t)(task_cache[0] - global_task_array);
+    atomic_store_explicit(
+        &task->next_free_idx, 
+        (uint32_t)(task_cache[TASK_CACHE_CAPACITY - 1] - global_task_array), 
+        memory_order_relaxed
+    );
+
+    uint32_t tail_idx = (uint32_t)(task_cache[start_evict] - global_task_array);
 
     uint64_t current_head = atomic_load_explicit(&global_pool_head, memory_order_relaxed);
 
@@ -125,7 +132,7 @@ void memory_pool_release(sc_task* task) {
         cpu_relax();
     }
     
-    task_cache_count = 0;
+    task_cache_count = start_evict;
 }
 // gets the amount of logical hardware threads
 size_t get_cpu_logical_proccessors(void) {
@@ -163,9 +170,9 @@ void internal_macro_job_splitter(void* user_data, size_t start_idx, size_t end_i
 void hooked_job_finish_task(void* payload,size_t start_inx,size_t end_inx);
 
 void scheduler_boot(size_t spsc_queue_size,size_t cl_deque_size){
-    size_t lp_count=get_cpu_logical_proccessors();
-    if(lp_count<1){
-        lp_count=1;
+    global_worker_count=get_cpu_logical_proccessors();
+    if(global_worker_count<1){
+        global_worker_count=1;
         printf("Bitch ass cpu core sys call \n");
     }
 
@@ -198,12 +205,13 @@ void scheduler_boot(size_t spsc_queue_size,size_t cl_deque_size){
 
     
     //allocate all worker threads and run them
-    worker_pool=allocate_worker_pool(lp_count,spsc_queue_size,cl_deque_size);
+    worker_pool=allocate_worker_pool(global_worker_count,spsc_queue_size,cl_deque_size);
+    
     if(!worker_pool){
         fprintf(stderr, "Fatal Hardware Error: Failed to allocate worker pool.\n");
         return;
     }
-    for(size_t i=0;i<lp_count;i++){
+    for(size_t i=0;i<global_worker_count;i++){
         #if defined(_WIN32)
             worker_pool[i].thread_handler = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)worker_main_loop, &worker_pool[i], 0, NULL);
             if(!worker_pool[i].thread_handler){
@@ -264,15 +272,14 @@ bool scheduler_submit_job(sc_job* job,size_t chunk_size){
     child_task->parent_task = root_task; 
     atomic_store(&child_task->unfinished_dependencies, 1);
 
-    size_t worker_count = get_cpu_logical_proccessors();
-    if (worker_count < 1) worker_count = 1;
-    size_t target_idx = atomic_fetch_add_explicit(&rr_worker_index, 1, memory_order_relaxed) % worker_count;
+    size_t target_idx = atomic_fetch_add_explicit(&rr_worker_index, 1, memory_order_relaxed) % global_worker_count;
 
     bool success =spsc_producer_push(&worker_pool[target_idx], child_task);
 
     if (!success) {
         //if spsc if full, return the task to the pool
         memory_pool_release(root_task);
+        memory_pool_release(child_task);
         return false;
     }
 
@@ -365,17 +372,12 @@ void scheduler_set_continuation(sc_job_fn next_task){
 void scheduler_stop_workers(){
     if(!worker_pool) return;
 
-    size_t lp_count = get_cpu_logical_proccessors();
-    while(lp_count<1){
-        lp_count = get_cpu_logical_proccessors();
-        printf("Bitch ass cpu core sys call \n");
-    }
 
-    for (size_t i = 0; i < lp_count; i++) {
+    for (size_t i = 0; i < global_worker_count; i++) {
         atomic_store_explicit(&worker_pool[i].termination_flag, true, memory_order_release);
     }
 
-    for (size_t i = 0; i < lp_count; i++) {
+    for (size_t i = 0; i < global_worker_count; i++) {
         #if defined(_WIN32)
             WaitForSingleObject(worker_pool[i].thread_handler, INFINITE);
             CloseHandle(worker_pool[i].thread_handler);
@@ -384,7 +386,7 @@ void scheduler_stop_workers(){
         #endif
     }
 
-    for (size_t i = 0; i < lp_count; i++) {
+    for (size_t i = 0; i < global_worker_count; i++) {
         if (worker_pool[i].cl_deque.buffer) {
             sys_aligned_free(worker_pool[i].cl_deque.buffer);
         }
@@ -424,13 +426,14 @@ void scheduler_wait_for_job(sc_job* job) {
         } 
         else {
             #if defined(_WIN32)
-                Sleep((DWORD)(sleep_ns / 1000000));
+                Sleep(0);
             #else
                 struct timespec ts = {0, sleep_ns};
                 nanosleep(&ts, NULL);
             #endif
             
-            if (sleep_ns < 1000000) {
+            // Cap at 100 microseconds
+            if (sleep_ns < 100000) {
                 sleep_ns *= 2; 
             }
         }

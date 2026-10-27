@@ -43,3 +43,4 @@ typedef struct{
 sc_worker* allocate_worker_pool(size_t logical_proccessors_amount,size_t spsc_queue_size,size_t cl_deque_size);
 
 void* worker_main_loop(void* worker);
+

@@ -2,7 +2,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-//aligns the pointer so that it would fit the aligment requirement
+//aligns the pointer so that it would fit the aligment requirement.
 //must use sys_aligned_free() to free it
 static inline void* sys_aligned_alloc(size_t alignment, size_t size) {
     size_t offset = alignment - 1 + sizeof(void*);
