@@ -4,14 +4,16 @@ A high-performance, lock-free task scheduling engine for C, designed for maximum
 
 the `sk-scheduler` is built on a Work-Stealing Chase-Lev deque architecture. It allows you to break massive workloads into small tasks and distribute them across all available CPU cores with virtually zero thread-contention. 
 
+The project took around 3-4 weeks to build (not including a 3-week break I took in the middle of it).
+
 (for anyone wondering,the sk part is based on my initials)
 ## Features
 
-* **Drop-in Integration:** Distributed as a single-header STB-style library. No build systems to configure.
-* **True Lock-Free:** Built entirely on C11 atomics, without any use of mutexes or locks.
+* **Drop-in Integration:** Distributed as a single-header STB-style library.
+* **Lock-Free:** Built entirely on C11 atomics, without any use of mutexes or locks.
 * **Work-Stealing:** Idle CPU cores steal work from busy cores with extra work to guarantee maximum hardware saturation.
-* **DAG Dependencies:** Safely spawn child sub-tasks from within running tasks to build complex execution graphs.
-* **POSIX Native:** integrates with Linux and macOS threading affinities and yields.
+* **DAG Dependencies:** Allows you to spawn child sub-tasks from within running tasks to build complex execution graphs.
+
 
 ## Installation
 
@@ -68,7 +70,7 @@ int main(void) {
     // 2. Boot the scheduler (SPSC queue size: 1024, Chase-Lev size: 4096)
     scheduler_boot(1024, 4096);
     
-    // 3. Initialize a job targeting 10,000 abstract elements
+    // 3. Initialize a job targeting 10,000 abstract elements(since we passed in NULL as the payload since the task function doesn't do anything with it)
     sc_job my_job;
     scheduler_init_job(&my_job, NULL, 10000, simple_task);
     
@@ -88,11 +90,11 @@ int main(void) {
     return 0;
 }
 ```
-for more types of examples, you can check out the examples folder and try running some of the examples yourself
+for more types of examples, you can check out the `examples/` folder and try running some of the examples yourself
 
 ## Current Progress
 
-right now, the scheduler is only in v1. it has been stress tested on my ubuntu linux machine and my windows machine only but i will try to conduct more tests on different machines/OS and try to find more bugs.
+I have completed everything i wanted to do for this project currently. I may return to it in the future if i find anything meaningful to change or i stumble upon a new bug.
 
 ## Documentation
 For a more deep explanation into the project architecture,mechanics, and concepts please refer to the <a href='C%20Job%20Scheduler-Full%20documentation.pdf'>Full Documentation</a>.
