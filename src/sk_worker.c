@@ -43,14 +43,12 @@ static inline uint32_t xorshift32(uint32_t* state) {
 //pops from the worker's spsc queue 
 static inline sc_task* spsc_consumer_pop(sc_worker* worker) {
     size_t current_head = atomic_load_explicit(&worker->rb_head, memory_order_relaxed);
-    
     if (current_head >= worker->rb_tail_cache) {
         worker->rb_tail_cache = atomic_load_explicit(&worker->rb_tail, memory_order_acquire);
         if (current_head >= worker->rb_tail_cache) {
             return NULL;
         }
-    }
-    
+    } 
     sc_task* task = worker->rb_buffer[current_head & worker->rb_capacity_mask];
     atomic_store_explicit(&worker->rb_head, current_head + 1, memory_order_release);
     return task;
@@ -131,7 +129,7 @@ void* worker_main_loop(void* arg) {
     size_t total_cores = global_worker_count;
     if (total_cores < 1){
         total_cores = 1;
-        printf("Bitch ass cpu core sys call \n");
+        fprintf(stderr, "Warning: Failed to query logical processor count, defaulting to 1.\n");
     }
 
     pin_thread_to_core(local_worker->core_id);
@@ -265,19 +263,18 @@ void* worker_main_loop(void* arg) {
 void hooked_job_finish_task(void* payload,size_t start_inx,size_t end_inx){
     (void)start_inx;
     (void)end_inx;
-    sc_job* job=(sc_job*)payload;
+    sc_job* job = (sc_job*)payload;
     
-    atomic_store_explicit(&job->is_done,true,memory_order_release );
+    // atomically transition state to DONE and fetch previous state
+    uint32_t prev_state = atomic_exchange_explicit(&job->state, JOB_STATE_DONE, memory_order_release);
+
+    // Only invoke the OS kernel wake syscall if a thread actually went to sleep on this job
+    if (prev_state == JOB_STATE_WAITING) {
+        sk_futex_wake(&job->state);
+    }
 }
 
-void no_op_continuation(void* payload, size_t start_idx, size_t end_idx) {
-    (void)start_idx;
-    (void)end_idx;
-    (void)payload;
-    return;
-}
-
-//splits the job into tasks into 2 halfs and keeps pushing right task to deque, until the payload size is smaller then chunk size
+//splits the job into 2 task halfs and keeps pushing right task to deque, until the payload size is smaller then chunk size
 void internal_macro_job_splitter(void* payload, size_t start_idx, size_t end_idx) {
     sc_job* job = (sc_job*)payload;
 

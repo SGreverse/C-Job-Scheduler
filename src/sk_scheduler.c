@@ -229,7 +229,7 @@ void scheduler_boot(size_t spsc_queue_size,size_t cl_deque_size){
 
 
 void scheduler_init_job(sc_job* job,void* payload,size_t payload_size,sc_job_fn job_fn){
-    job->is_done=false;
+    atomic_init(&job->state, JOB_STATE_RUNNING);
     job->job_payload=payload;
     job->payload_size=payload_size;
     job->job_function=job_fn;
@@ -407,35 +407,30 @@ void scheduler_stop_workers(){
 }
 
 void scheduler_wait_for_job(sc_job* job) {
-    uint32_t spin_count = 0;
-    uint32_t yield_count = 0;
-    long sleep_ns = 1000; 
-
-    while (!scheduler_is_job_complete(job)) {
-        if (spin_count < 1000) {
-            cpu_relax();
-            spin_count++;
-        } 
-        else if (yield_count < 50) {
-            #if defined(_WIN32)
-                Sleep(0);
-            #else
-                sched_yield(); 
-            #endif
-            yield_count++;
-        } 
-        else {
-            #if defined(_WIN32)
-                Sleep(0);
-            #else
-                struct timespec ts = {0, sleep_ns};
-                nanosleep(&ts, NULL);
-            #endif
-            
-            // Cap at 100 microseconds
-            if (sleep_ns < 100000) {
-                sleep_ns *= 2; 
+    // 1. Brief user-space spin (~10-15 us) for ultra-fast micro-jobs
+    for (uint32_t spin = 0; spin < 1000; spin++) {
+        if (scheduler_is_job_complete(job)) {
+            return;
+        }
+        cpu_relax();
+    }
+    //transition form running to waiting and wait for wake up from the kernel
+    uint32_t state = atomic_load_explicit(&job->state, memory_order_acquire);
+    while (state != JOB_STATE_DONE) {
+        if (state == JOB_STATE_RUNNING) {
+            if (!atomic_compare_exchange_weak_explicit(
+                    &job->state,
+                    &state,
+                    JOB_STATE_WAITING,
+                    memory_order_relaxed,
+                    memory_order_acquire)) {
+                continue; // state changed (likely to JOB_STATE_DONE) loop again to check is its done
             }
         }
+
+        // sleep until hooked_job_finish_task calls sk_futex_wake
+        sk_futex_wait(&job->state, JOB_STATE_WAITING);
+        //we run this in a loop since the thread can
+        state = atomic_load_explicit(&job->state, memory_order_acquire);
     }
 }

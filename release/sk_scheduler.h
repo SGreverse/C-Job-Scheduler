@@ -7,6 +7,7 @@
 #endif
 
 #pragma once
+#define _GNU_SOURCE
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
     #include <immintrin.h>
     #define cpu_relax() _mm_pause()
@@ -19,11 +20,52 @@
 
 #include <stdatomic.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdalign.h>
 #include <stdbool.h>
-#if !defined (_WIN32)
+
+#if defined(__linux__)
     #include <unistd.h>
+    #include <limits.h>
+    #include <sys/syscall.h>
+    #include <linux/futex.h>
+
+    static inline void sk_futex_wait(_Atomic uint32_t* addr, uint32_t expected) {
+        syscall(SYS_futex, (uint32_t*)addr, FUTEX_WAIT_PRIVATE, expected, NULL, NULL, 0);
+    }
+
+    static inline void sk_futex_wake(_Atomic uint32_t* addr) {
+        syscall(SYS_futex, (uint32_t*)addr, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+    }
+#elif defined(_WIN32)
+    #include <windows.h>
+    #pragma comment(lib, "Synchronization.lib")
+
+    static inline void sk_futex_wait(_Atomic uint32_t* addr, uint32_t expected) {
+        WaitOnAddress((volatile VOID*)addr, &expected, sizeof(uint32_t), INFINITE);
+    }
+
+    static inline void sk_futex_wake(_Atomic uint32_t* addr) {
+        WakeByAddressAll((PVOID)addr);
+    }
+#else
+    #include <unistd.h>
+    #include <sched.h>
+
+    static inline void sk_futex_wait(_Atomic uint32_t* addr, uint32_t expected) {
+        if (atomic_load_explicit(addr, memory_order_relaxed) == expected) {
+            sched_yield();
+        }
+    }
+
+    static inline void sk_futex_wake(_Atomic uint32_t* addr) {
+        (void)addr;
+    }
 #endif
+
+#define JOB_STATE_RUNNING 0U
+#define JOB_STATE_WAITING 1U
+#define JOB_STATE_DONE    2U
 
 //the function each worker will call to execute( written and passed by the developer)
 typedef void (*sc_job_fn)(void* user_data, size_t start_idx, size_t end_idx);
@@ -32,7 +74,7 @@ typedef void (*sc_job_fn)(void* user_data, size_t start_idx, size_t end_idx);
 typedef struct {
     
     //aligning prevents false sharing when jobs are in array
-    alignas(64) atomic_bool is_done;
+    alignas(64) _Atomic uint32_t state;
 
     void* job_payload;
 
@@ -57,7 +99,7 @@ void scheduler_init_job(sc_job* empty_job,void* payload,size_t payload_size,sc_j
 bool scheduler_submit_job(sc_job* job,size_t chunk_size);
 
 static inline bool scheduler_is_job_complete(sc_job* job) {
-    return atomic_load_explicit(&job->is_done, memory_order_acquire);
+    return atomic_load_explicit(&job->state, memory_order_acquire) == JOB_STATE_DONE;
 }
 
 //sets what the parent task will execute after the child tasks that he spawned finish and parent task will start executing again
@@ -413,14 +455,12 @@ static inline uint32_t xorshift32(uint32_t* state) {
 //pops from the worker's spsc queue 
 static inline sc_task* spsc_consumer_pop(sc_worker* worker) {
     size_t current_head = atomic_load_explicit(&worker->rb_head, memory_order_relaxed);
-    
     if (current_head >= worker->rb_tail_cache) {
         worker->rb_tail_cache = atomic_load_explicit(&worker->rb_tail, memory_order_acquire);
         if (current_head >= worker->rb_tail_cache) {
             return NULL;
         }
-    }
-    
+    } 
     sc_task* task = worker->rb_buffer[current_head & worker->rb_capacity_mask];
     atomic_store_explicit(&worker->rb_head, current_head + 1, memory_order_release);
     return task;
@@ -501,7 +541,7 @@ void* worker_main_loop(void* arg) {
     size_t total_cores = global_worker_count;
     if (total_cores < 1){
         total_cores = 1;
-        printf("Bitch ass cpu core sys call \n");
+        fprintf(stderr, "Warning: Failed to query logical processor count, defaulting to 1.\n");
     }
 
     pin_thread_to_core(local_worker->core_id);
@@ -635,19 +675,18 @@ void* worker_main_loop(void* arg) {
 void hooked_job_finish_task(void* payload,size_t start_inx,size_t end_inx){
     (void)start_inx;
     (void)end_inx;
-    sc_job* job=(sc_job*)payload;
+    sc_job* job = (sc_job*)payload;
     
-    atomic_store_explicit(&job->is_done,true,memory_order_release );
+    // atomically transition state to DONE and fetch previous state
+    uint32_t prev_state = atomic_exchange_explicit(&job->state, JOB_STATE_DONE, memory_order_release);
+
+    // Only invoke the OS kernel wake syscall if a thread actually went to sleep on this job
+    if (prev_state == JOB_STATE_WAITING) {
+        sk_futex_wake(&job->state);
+    }
 }
 
-void no_op_continuation(void* payload, size_t start_idx, size_t end_idx) {
-    (void)start_idx;
-    (void)end_idx;
-    (void)payload;
-    return;
-}
-
-//splits the job into tasks into 2 halfs and keeps pushing right task to deque, until the payload size is smaller then chunk size
+//splits the job into 2 task halfs and keeps pushing right task to deque, until the payload size is smaller then chunk size
 void internal_macro_job_splitter(void* payload, size_t start_idx, size_t end_idx) {
     sc_job* job = (sc_job*)payload;
 
@@ -927,7 +966,7 @@ void scheduler_boot(size_t spsc_queue_size,size_t cl_deque_size){
 
 
 void scheduler_init_job(sc_job* job,void* payload,size_t payload_size,sc_job_fn job_fn){
-    job->is_done=false;
+    atomic_init(&job->state, JOB_STATE_RUNNING);
     job->job_payload=payload;
     job->payload_size=payload_size;
     job->job_function=job_fn;
@@ -1105,36 +1144,31 @@ void scheduler_stop_workers(){
 }
 
 void scheduler_wait_for_job(sc_job* job) {
-    uint32_t spin_count = 0;
-    uint32_t yield_count = 0;
-    long sleep_ns = 1000; 
-
-    while (!scheduler_is_job_complete(job)) {
-        if (spin_count < 1000) {
-            cpu_relax();
-            spin_count++;
-        } 
-        else if (yield_count < 50) {
-            #if defined(_WIN32)
-                Sleep(0);
-            #else
-                sched_yield(); 
-            #endif
-            yield_count++;
-        } 
-        else {
-            #if defined(_WIN32)
-                Sleep(0);
-            #else
-                struct timespec ts = {0, sleep_ns};
-                nanosleep(&ts, NULL);
-            #endif
-            
-            // Cap at 100 microseconds
-            if (sleep_ns < 100000) {
-                sleep_ns *= 2; 
+    // 1. Brief user-space spin (~10-15 us) for ultra-fast micro-jobs
+    for (uint32_t spin = 0; spin < 1000; spin++) {
+        if (scheduler_is_job_complete(job)) {
+            return;
+        }
+        cpu_relax();
+    }
+    //transition form running to waiting and wait for wake up from the kernel
+    uint32_t state = atomic_load_explicit(&job->state, memory_order_acquire);
+    while (state != JOB_STATE_DONE) {
+        if (state == JOB_STATE_RUNNING) {
+            if (!atomic_compare_exchange_weak_explicit(
+                    &job->state,
+                    &state,
+                    JOB_STATE_WAITING,
+                    memory_order_relaxed,
+                    memory_order_acquire)) {
+                continue; // state changed (likely to JOB_STATE_DONE) loop again to check is its done
             }
         }
+
+        // sleep until hooked_job_finish_task calls sk_futex_wake
+        sk_futex_wait(&job->state, JOB_STATE_WAITING);
+        //we run this in a loop since the thread can
+        state = atomic_load_explicit(&job->state, memory_order_acquire);
     }
 }
 

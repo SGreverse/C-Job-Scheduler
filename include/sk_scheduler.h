@@ -1,4 +1,5 @@
 #pragma once
+#define _GNU_SOURCE
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
     #include <immintrin.h>
     #define cpu_relax() _mm_pause()
@@ -12,11 +13,53 @@
 #include "sk_worker.h"
 #include <stdatomic.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdalign.h>
 #include <stdbool.h>
-#if !defined (_WIN32)
+
+#if defined(__linux__)
     #include <unistd.h>
+    #include <limits.h>
+    #include <sys/syscall.h>
+    #include <linux/futex.h>
+
+    static inline void sk_futex_wait(_Atomic uint32_t* addr, uint32_t expected) {
+        syscall(SYS_futex, (uint32_t*)addr, FUTEX_WAIT_PRIVATE, expected, NULL, NULL, 0);
+    }
+
+    static inline void sk_futex_wake(_Atomic uint32_t* addr) {
+        syscall(SYS_futex, (uint32_t*)addr, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+    }
+#elif defined(_WIN32)
+    #include <windows.h>
+    #pragma comment(lib, "Synchronization.lib")
+
+    static inline void sk_futex_wait(_Atomic uint32_t* addr, uint32_t expected) {
+        WaitOnAddress((volatile VOID*)addr, &expected, sizeof(uint32_t), INFINITE);
+    }
+
+    static inline void sk_futex_wake(_Atomic uint32_t* addr) {
+        WakeByAddressAll((PVOID)addr);
+    }
+#else
+    #include <unistd.h>
+    #include <sched.h>
+
+    static inline void sk_futex_wait(_Atomic uint32_t* addr, uint32_t expected) {
+        if (atomic_load_explicit(addr, memory_order_relaxed) == expected) {
+            sched_yield();
+        }
+    }
+
+    static inline void sk_futex_wake(_Atomic uint32_t* addr) {
+        (void)addr;
+    }
 #endif
+
+#define JOB_STATE_RUNNING 0U
+#define JOB_STATE_WAITING 1U
+#define JOB_STATE_DONE    2U
+
 extern sc_worker* worker_pool;
 
 //the function each worker will call to execute( written and passed by the developer)
@@ -26,7 +69,7 @@ typedef void (*sc_job_fn)(void* user_data, size_t start_idx, size_t end_idx);
 typedef struct {
     
     //aligning prevents false sharing when jobs are in array
-    alignas(64) atomic_bool is_done;
+    alignas(64) _Atomic uint32_t state;
 
     void* job_payload;
 
@@ -51,7 +94,7 @@ void scheduler_init_job(sc_job* empty_job,void* payload,size_t payload_size,sc_j
 bool scheduler_submit_job(sc_job* job,size_t chunk_size);
 
 static inline bool scheduler_is_job_complete(sc_job* job) {
-    return atomic_load_explicit(&job->is_done, memory_order_acquire);
+    return atomic_load_explicit(&job->state, memory_order_acquire) == JOB_STATE_DONE;
 }
 
 //sets what the parent task will execute after the child tasks that he spawned finish and parent task will start executing again
