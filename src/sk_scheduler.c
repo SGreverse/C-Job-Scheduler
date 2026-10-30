@@ -149,7 +149,7 @@ size_t get_cpu_logical_proccessors(void) {
 #endif
 }
 
-static inline bool spsc_producer_push(sc_worker* worker, sc_task* task) {
+static inline bool spmc_producer_push(sc_worker* worker, sc_task* task) {
     size_t current_tail = atomic_load_explicit(&worker->rb_tail, memory_order_relaxed);
     size_t capacity = worker->rb_capacity_mask + 1;
 
@@ -274,7 +274,7 @@ bool scheduler_submit_job(sc_job* job,size_t chunk_size){
 
     size_t target_idx = atomic_fetch_add_explicit(&rr_worker_index, 1, memory_order_relaxed) % global_worker_count;
 
-    bool success =spsc_producer_push(&worker_pool[target_idx], child_task);
+    bool success =spmc_producer_push(&worker_pool[target_idx], child_task);
 
     if (!success) {
         //if spsc if full, return the task to the pool

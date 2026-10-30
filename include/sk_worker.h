@@ -29,7 +29,6 @@ typedef struct{
     sc_cl_deque cl_deque;
 
     alignas(64) atomic_size_t rb_head;
-    size_t rb_tail_cache; 
 
     alignas(64) atomic_size_t rb_tail;
     size_t rb_head_cache; 
