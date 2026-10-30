@@ -395,7 +395,6 @@ typedef struct{
     sc_cl_deque cl_deque;
 
     alignas(64) atomic_size_t rb_head;
-    size_t rb_tail_cache; 
 
     alignas(64) atomic_size_t rb_tail;
     size_t rb_head_cache; 
@@ -452,20 +451,27 @@ static inline uint32_t xorshift32(uint32_t* state) {
 }
 
 
-//pops from the worker's spsc queue 
-static inline sc_task* spsc_consumer_pop(sc_worker* worker) {
+//pops from the worker's spmc queue 
+static inline sc_task* spmc_consumer_pop(sc_worker* worker) {
     size_t current_head = atomic_load_explicit(&worker->rb_head, memory_order_relaxed);
-    if (current_head >= worker->rb_tail_cache) {
-        worker->rb_tail_cache = atomic_load_explicit(&worker->rb_tail, memory_order_acquire);
-        if (current_head >= worker->rb_tail_cache) {
-            return NULL;
-        }
-    } 
+    size_t current_tail = atomic_load_explicit(&worker->rb_tail, memory_order_acquire);
+    
+    if (current_head >= current_tail) {
+        return NULL;
+    }
+    
     sc_task* task = worker->rb_buffer[current_head & worker->rb_capacity_mask];
-    atomic_store_explicit(&worker->rb_head, current_head + 1, memory_order_release);
-    return task;
+    
+    if (atomic_compare_exchange_strong_explicit(
+            &worker->rb_head, 
+            &current_head, 
+            current_head + 1, 
+            memory_order_release, 
+            memory_order_relaxed)) {
+        return task;
+    }
+    return NULL;
 }
-
 static inline void pin_thread_to_core(size_t core_id) {
 #if defined(__linux__)
     cpu_set_t cpuset;
@@ -519,7 +525,6 @@ sc_worker* allocate_worker_pool(size_t logical_proccessors_amount,size_t spsc_qu
         atomic_init(&pool[i].rb_head, 0);
         atomic_init(&pool[i].rb_tail, 0);
         pool[i].rb_head_cache = 0;
-        pool[i].rb_tail_cache = 0;
         pool[i].rb_buffer = (sc_task**)sys_aligned_alloc(64, actual_size * sizeof(sc_task*));
         if (!pool[i].rb_buffer){
             fprintf(stderr, "Malloc failure: Couldn't allocate spsc buffer");
@@ -554,7 +559,7 @@ void* worker_main_loop(void* arg) {
 
         // if chase lev queue is empty, try finding a task in the spsc queue
         if (!tl_current_task) {
-            tl_current_task = spsc_consumer_pop(local_worker);
+            tl_current_task = spmc_consumer_pop(local_worker);
         }
 
         //steal work
@@ -565,6 +570,10 @@ void* worker_main_loop(void* arg) {
                     victim_id++; // Uniformly maps [0 .. N-2] to all cores except local_worker->core_id!
                 }
                 tl_current_task = chase_lev_steal(&worker_pool[victim_id].cl_deque);
+                //if his deque is empty, try to steal from his spmc
+                if (!tl_current_task) {
+                    tl_current_task = spmc_consumer_pop(&worker_pool[victim_id]);
+                }
             }
         }
 
@@ -627,9 +636,8 @@ void* worker_main_loop(void* arg) {
                     // check if it has a continuation function to run(same process as before)
                     while (parent->task_fn != NULL) {
                         atomic_store_explicit(&parent->unfinished_dependencies, 1, memory_order_relaxed);
-
-                        if (chase_lev_push(&local_worker->cl_deque, parent)) {
-                            // Successfully scheduled parent's continuation on our deque!
+                        //if the push of the continuation has succeeded and the parent isnt the root task
+                        if (parent->parent_task != NULL && chase_lev_push(&local_worker->cl_deque, parent)) {
                             parent = NULL;
                             break;
                         }
@@ -886,7 +894,7 @@ size_t get_cpu_logical_proccessors(void) {
 #endif
 }
 
-static inline bool spsc_producer_push(sc_worker* worker, sc_task* task) {
+static inline bool spmc_producer_push(sc_worker* worker, sc_task* task) {
     size_t current_tail = atomic_load_explicit(&worker->rb_tail, memory_order_relaxed);
     size_t capacity = worker->rb_capacity_mask + 1;
 
@@ -1011,7 +1019,7 @@ bool scheduler_submit_job(sc_job* job,size_t chunk_size){
 
     size_t target_idx = atomic_fetch_add_explicit(&rr_worker_index, 1, memory_order_relaxed) % global_worker_count;
 
-    bool success =spsc_producer_push(&worker_pool[target_idx], child_task);
+    bool success =spmc_producer_push(&worker_pool[target_idx], child_task);
 
     if (!success) {
         //if spsc if full, return the task to the pool
